@@ -1,0 +1,113 @@
+# caido-headless-client
+
+Dependency-free Node.js client and CLI for Caido's GraphQL and REST APIs, built for secure automation without npm packages.
+
+## Why
+
+This client is meant for agent and script workflows where supply-chain risk matters. It uses only Node's built-in runtime APIs:
+
+- `fetch` for GraphQL and REST requests
+- `WebSocket` for GraphQL subscriptions
+- Node standard library modules for file and token handling
+
+No `npm install` is required.
+
+## Requirements
+
+- Node.js 24 or newer
+- A running Caido instance
+- A Caido Personal Access Token for first-time setup
+
+## Setup
+
+Create a PAT in Caido Dashboard -> Developer -> Personal Access Tokens, then run:
+
+```bash
+node caido-client.mjs setup <pat> <caido-url> --no-save-pat
+```
+
+Example for a local Caido instance:
+
+```bash
+node caido-client.mjs setup <pat> http://localhost:8080 --no-save-pat
+```
+
+The setup command starts Caido's device-code auth flow, approves it with the PAT, then caches OAuth access and refresh tokens in `~/.claude/config/secrets.json`. Use `--no-save-pat` to avoid persisting the PAT.
+
+Check status:
+
+```bash
+node caido-client.mjs auth-status
+```
+
+## Usage
+
+Search HTTP history:
+
+```bash
+node caido-client.mjs search 'req.host.cont:"api"' --limit 20
+node caido-client.mjs recent --limit 10
+```
+
+Retrieve requests and responses:
+
+```bash
+node caido-client.mjs get <request-id>
+node caido-client.mjs get-response <request-id> --compact
+node caido-client.mjs export-curl <request-id>
+```
+
+Byte-safe downloads:
+
+```bash
+node caido-client.mjs download <request-id> --out body.bin
+node caido-client.mjs download <request-id> --response --raw --out response.http
+node caido-client.mjs download <request-id> --request --raw --out request.http
+```
+
+Replay and edit traffic through Caido:
+
+```bash
+node caido-client.mjs replay <request-id> --compact
+node caido-client.mjs edit <request-id> --path /api/test --set-header "X-Test: 1" --compact
+node caido-client.mjs send-raw --host example.com --raw "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+```
+
+Management commands:
+
+```bash
+node caido-client.mjs scopes
+node caido-client.mjs filters
+node caido-client.mjs envs
+node caido-client.mjs findings --limit 10
+node caido-client.mjs replay-sessions --limit 10
+node caido-client.mjs plugins
+node caido-client.mjs health
+```
+
+Show all commands:
+
+```bash
+node caido-client.mjs --help
+```
+
+## Auth Environment Variables
+
+- `CAIDO_URL`: Caido instance URL
+- `CAIDO_PAT`: PAT for bootstrap auth
+- `CAIDO_ACCESS_TOKEN`: direct bearer token override
+
+Auth resolution order:
+
+1. `CAIDO_ACCESS_TOKEN`
+2. Valid cached access token
+3. Cached refresh token
+4. `CAIDO_PAT`
+5. Stored PAT, if present
+
+## Security Notes
+
+- Prefer `setup ... --no-save-pat`.
+- Do not commit `~/.claude/config/secrets.json`.
+- This repository intentionally has no npm dependencies or install scripts.
+- `download` writes raw bytes directly from Caido's stored raw data, so binary bodies are not converted through UTF-8.

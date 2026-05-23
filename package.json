@@ -1,0 +1,14 @@
+{
+  "name": "caido-headless-client",
+  "version": "0.1.0",
+  "description": "Dependency-free Node.js client and CLI for Caido's GraphQL and REST APIs, built for secure automation without npm packages.",
+  "type": "module",
+  "bin": {
+    "caido-client": "./caido-client.mjs"
+  },
+  "scripts": {
+    "check": "node --check caido-client.mjs",
+    "caido": "node caido-client.mjs"
+  },
+  "dependencies": {}
+}
