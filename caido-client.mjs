@@ -207,12 +207,30 @@ function messageDataToString(data) {
   return Promise.resolve(String(data));
 }
 
-function createGraphqlWebSocket(url, accessToken) {
-  if (typeof WebSocket === "undefined") {
-    throw new Error("Global WebSocket is not available. Use Node 24+ for dependency-free mode.");
-  }
+let webSocketImplPromise;
 
-  const ws = new WebSocket(websocketUrl(url), "graphql-transport-ws");
+function resolveWebSocketImpl() {
+  if (!webSocketImplPromise) {
+    webSocketImplPromise = (async () => {
+      if (typeof WebSocket !== "undefined") return WebSocket;
+      try {
+        const mod = await import("ws");
+        return mod.WebSocket || mod.default;
+      } catch {
+        throw new Error(
+          "Global WebSocket is not available (requires Node 22.4+; this skill documents Node 24+).\n" +
+          "Either upgrade Node (e.g. `nvm install 24`) or install the optional `ws` fallback:\n" +
+          "  cd skills/caido-mode/client && npm install ws",
+        );
+      }
+    })();
+  }
+  return webSocketImplPromise;
+}
+
+async function createGraphqlWebSocket(url, accessToken) {
+  const WebSocketImpl = await resolveWebSocketImpl();
+  const ws = new WebSocketImpl(websocketUrl(url), "graphql-transport-ws");
   ws.addEventListener("open", () => {
     const payload = accessToken ? { Authorization: `Bearer ${accessToken}` } : {};
     ws.send(JSON.stringify({ type: "connection_init", payload }));
@@ -220,9 +238,9 @@ function createGraphqlWebSocket(url, accessToken) {
   return ws;
 }
 
-function graphqlSubscribeFirst(url, accessToken, query, variables, match, timeoutMs) {
+async function graphqlSubscribeFirst(url, accessToken, query, variables, match, timeoutMs) {
+  const ws = await createGraphqlWebSocket(url, accessToken);
   return new Promise((resolvePromise, rejectPromise) => {
-    const ws = createGraphqlWebSocket(url, accessToken);
     const id = "1";
     let settled = false;
     let subscribed = false;
@@ -290,9 +308,9 @@ function graphqlSubscribeFirst(url, accessToken, query, variables, match, timeou
   });
 }
 
-function createFinishedTaskWatcher(url, accessToken, timeoutMs = 300_000) {
+async function createFinishedTaskWatcher(url, accessToken, timeoutMs = 300_000) {
+  const ws = await createGraphqlWebSocket(url, accessToken);
   return new Promise((resolveReady, rejectReady) => {
-    const ws = createGraphqlWebSocket(url, accessToken);
     const id = "1";
     const events = [];
     const waiters = new Map();

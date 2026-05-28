@@ -14,9 +14,17 @@ No `npm install` is required.
 
 ## Requirements
 
-- Node.js 24 or newer
+- Node.js 24 or newer (Node 22.4+ also works; older Node requires the optional `ws` fallback below)
 - A running Caido instance
 - A Caido Personal Access Token for first-time setup
+
+### WebSocket fallback for older Node
+
+The client uses Node's built-in global `WebSocket`, enabled by default in Node 22.4+. On older runtimes you'll see `Global WebSocket is not available...`. To fix without upgrading Node, install the optional `ws` package in this directory — it's auto-detected at runtime and remains optional:
+
+```bash
+npm install ws
+```
 
 ## Setup
 
