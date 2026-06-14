@@ -514,7 +514,31 @@ class CaidoClient {
     if (!response.ok) throw new Error(`Health HTTP ${response.status}: ${await response.text()}`);
     return response.json();
   }
+
+  async getServerVersion() {
+    if (!this._versionPromise) {
+      this._versionPromise = (async () => {
+        const info = await this.health();
+        return parseSemver(info?.version);
+      })();
+    }
+    return this._versionPromise;
+  }
 }
+
+function parseSemver(value) {
+  const match = String(value || "").match(/^v?(\d+)\.(\d+)\.(\d+)/);
+  if (!match) return { major: 0, minor: 0, patch: 0, raw: String(value || "") };
+  return { major: +match[1], minor: +match[2], patch: +match[3], raw: String(value) };
+}
+
+function versionGte(actual, target) {
+  if (actual.major !== target.major) return actual.major > target.major;
+  if (actual.minor !== target.minor) return actual.minor > target.minor;
+  return actual.patch >= target.patch;
+}
+
+const CAIDO_V057 = { major: 0, minor: 57, patch: 0 };
 
 async function getClient() {
   const explicitEnvUrl = process.env.CAIDO_URL || process.env.CAIDO_INSTANCE_URL;
@@ -897,11 +921,30 @@ async function renameReplaySession(client, id, name) {
 }
 
 async function getReplayEntry(client, id, includeReplayRaw = true, includeRequestRaw = true, includeResponseRaw = true) {
+  const version = await client.getServerVersion();
+  if (versionGte(version, CAIDO_V057)) {
+    const data = await client.graphql(REPLAY_ENTRY_QUERY_V057, {
+      id,
+      sessionKind: "HTTP",
+      includeReplayRaw,
+      includeRequestRaw,
+      includeResponseRaw,
+    });
+    return data.replayEntry;
+  }
   const data = await client.graphql(REPLAY_ENTRY_QUERY, { id, includeReplayRaw, includeRequestRaw, includeResponseRaw });
   return data.replayEntry;
 }
 
 async function sendReplay(client, sessionId, raw, connection) {
+  const version = await client.getServerVersion();
+  if (versionGte(version, CAIDO_V057)) {
+    return sendReplayV057(client, sessionId, raw, connection);
+  }
+  return sendReplayV056(client, sessionId, raw, connection);
+}
+
+async function sendReplayV056(client, sessionId, raw, connection) {
   const input = {
     connection,
     raw: encodeRaw(raw),
@@ -911,11 +954,52 @@ async function sendReplay(client, sessionId, raw, connection) {
       placeholders: [],
     },
   };
+  return runReplayTask(client, START_REPLAY_TASK_V056, { sessionId, input });
+}
+
+async function sendReplayV057(client, sessionId, raw, connection) {
+  const sessionData = await client.graphql(REPLAY_SESSION_FOR_SEND_V057, { id: sessionId });
+  const session = sessionData.replaySession;
+  if (!session) throw new Error(`Replay session ${sessionId} not found`);
+  if (session.__typename !== "ReplaySessionHttp") {
+    throw new Error(`Replay session ${sessionId} is not an HTTP session (${session.__typename})`);
+  }
+
+  const entryId =
+    session.activeEntry?.id ||
+    session.entries?.edges?.[session.entries.edges.length - 1]?.node?.id;
+  if (!entryId) throw new Error(`Replay session ${sessionId} has no entry to update`);
+
+  const encoded = encodeRaw(raw);
+  await client.graphql(UPDATE_REPLAY_ENTRY_DRAFT_V057, {
+    id: entryId,
+    input: {
+      http: {
+        connection,
+        editorState: encoded,
+        raw: encoded,
+        settings: { placeholders: [] },
+      },
+    },
+  });
+
+  const current = session.settings || {};
+  if (current.connectionClose !== false || current.updateContentLength !== true) {
+    await client.graphql(UPDATE_REPLAY_SESSION_SETTINGS_V057, {
+      id: sessionId,
+      input: { http: { connectionClose: false, updateContentLength: true } },
+    });
+  }
+
+  return runReplayTask(client, START_REPLAY_TASK_V057, { sessionId });
+}
+
+async function runReplayTask(client, mutation, variables) {
   const watcher = await createFinishedTaskWatcher(client.url, client.token);
   let task;
   let finished;
   try {
-    const started = await client.graphql(START_REPLAY_TASK, { sessionId, input });
+    const started = await client.graphql(mutation, variables);
     task = requirePayload(started.startReplayTask, "task", "startReplayTask");
     finished = await watcher.waitForTask(task.id);
   } finally {
@@ -2093,7 +2177,7 @@ mutation DeleteReplaySessionCollection($id: ID!) {
   deleteReplaySessionCollection(id: $id) { deletedId }
 }`;
 
-const START_REPLAY_TASK = `
+const START_REPLAY_TASK_V056 = `
 mutation StartReplayTask($sessionId: ID!, $input: StartReplayTaskInput!) {
   startReplayTask(sessionId: $sessionId, input: $input) {
     error { __typename }
@@ -2102,6 +2186,60 @@ mutation StartReplayTask($sessionId: ID!, $input: StartReplayTaskInput!) {
       id
       createdAt
       ... on ReplayTask { replayEntry { id } }
+    }
+  }
+}`;
+
+const START_REPLAY_TASK_V057 = `
+mutation StartReplayTask($sessionId: ID!) {
+  startReplayTask(sessionId: $sessionId) {
+    error { __typename }
+    task {
+      __typename
+      id
+      createdAt
+      ... on ReplayTask { replayEntry { id } }
+    }
+  }
+}`;
+
+const UPDATE_REPLAY_ENTRY_DRAFT_V057 = `
+mutation UpdateReplayEntryDraft($id: ID!, $input: UpdateReplayEntryDraftInput!) {
+  updateReplayEntryDraft(id: $id, input: $input) { entry { id } }
+}`;
+
+const UPDATE_REPLAY_SESSION_SETTINGS_V057 = `
+mutation UpdateReplaySessionSettings($id: ID!, $input: ReplaySessionSettingsInput!) {
+  updateReplaySessionSettings(id: $id, input: $input) { session { id } }
+}`;
+
+const REPLAY_SESSION_FOR_SEND_V057 = `
+query ReplaySessionForSend($id: ID!) {
+  replaySession(id: $id) {
+    __typename
+    ... on ReplaySessionHttp {
+      id
+      activeEntry { id }
+      entries(last: 1) { edges { node { id } } }
+      settings { connectionClose updateContentLength }
+    }
+  }
+}`;
+
+const REPLAY_ENTRY_QUERY_V057 = `
+${CONNECTION_FRAGMENT}
+${REQUEST_FULL_FRAGMENT}
+query ReplayEntry($id: ID!, $sessionKind: ReplaySessionKind!, $includeReplayRaw: Boolean!, $includeRequestRaw: Boolean!, $includeResponseRaw: Boolean!) {
+  replayEntry(id: $id, sessionKind: $sessionKind) {
+    __typename
+    ... on ReplayEntryHttp {
+      connection { ...ConnectionInfoFull }
+      createdAt
+      error
+      id
+      raw @include(if: $includeReplayRaw)
+      request { ...RequestFull }
+      session { id }
     }
   }
 }`;
