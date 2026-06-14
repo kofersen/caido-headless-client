@@ -909,14 +909,20 @@ async function getRequest(client, id, includeRequestRaw, includeResponseRaw) {
 }
 
 async function createReplaySession(client, requestSource, collectionId) {
+  const version = await client.getServerVersion();
+  const isV057 = versionGte(version, CAIDO_V057);
   const input = { requestSource };
   if (collectionId) input.collectionId = collectionId;
-  const data = await client.graphql(CREATE_REPLAY_SESSION, { input });
+  if (isV057) input.kind = "HTTP";
+  const mutation = isV057 ? CREATE_REPLAY_SESSION_V057 : CREATE_REPLAY_SESSION;
+  const data = await client.graphql(mutation, { input });
   return requirePayload(data.createReplaySession, "session", "createReplaySession");
 }
 
 async function renameReplaySession(client, id, name) {
-  const data = await client.graphql(RENAME_REPLAY_SESSION, { id, name });
+  const version = await client.getServerVersion();
+  const mutation = versionGte(version, CAIDO_V057) ? RENAME_REPLAY_SESSION_V057 : RENAME_REPLAY_SESSION;
+  const data = await client.graphql(mutation, { id, name });
   return requirePayload(data.renameReplaySession, "session", "renameReplaySession");
 }
 
@@ -1015,14 +1021,19 @@ async function runReplayTask(client, mutation, variables) {
 }
 
 async function resolveSession(client, idOrName) {
+  const version = await client.getServerVersion();
+  const isV057 = versionGte(version, CAIDO_V057);
+  const sessionQuery = isV057 ? REPLAY_SESSION_QUERY_V057 : REPLAY_SESSION_QUERY;
+  const sessionsQuery = isV057 ? REPLAY_SESSIONS_QUERY_V057 : REPLAY_SESSIONS_QUERY;
+
   try {
-    const direct = await client.graphql(REPLAY_SESSION_QUERY, { id: idOrName });
+    const direct = await client.graphql(sessionQuery, { id: idOrName });
     if (direct.replaySession) return direct.replaySession;
   } catch {}
 
   let after;
   while (true) {
-    const page = await client.graphql(REPLAY_SESSIONS_QUERY, { first: 100, after });
+    const page = await client.graphql(sessionsQuery, { first: 100, after });
     for (const edge of page.replaySessions.edges) {
       if (edge.node.name === idOrName) return edge.node;
     }
@@ -1199,7 +1210,9 @@ async function cmdReplayEntries(sessionIdOrName, limit, opts, includeRaw) {
   const client = await getClient();
   const session = await resolveSession(client, sessionIdOrName);
   if (!session) die(`Replay session "${sessionIdOrName}" not found`);
-  const data = await client.graphql(REPLAY_SESSION_ENTRIES_QUERY, {
+  const version = await client.getServerVersion();
+  const query = versionGte(version, CAIDO_V057) ? REPLAY_SESSION_ENTRIES_QUERY_V057 : REPLAY_SESSION_ENTRIES_QUERY;
+  const data = await client.graphql(query, {
     id: session.id,
     first: limit,
     includeReplayRaw: includeRaw,
@@ -1233,7 +1246,9 @@ async function cmdEditSession(sessionIdOrName, edits, opts, overrides) {
 
 async function cmdReplaySessions(limit) {
   const client = await getClient();
-  const data = await client.graphql(REPLAY_SESSIONS_QUERY, { first: limit });
+  const version = await client.getServerVersion();
+  const query = versionGte(version, CAIDO_V057) ? REPLAY_SESSIONS_QUERY_V057 : REPLAY_SESSIONS_QUERY;
+  const data = await client.graphql(query, { first: limit });
   const results = data.replaySessions.edges.map((e) => sessionOutput(e.node));
   printJson({ results, count: results.length });
 }
@@ -1250,7 +1265,9 @@ async function cmdRenameSession(sessionId, name) {
 
 async function cmdMoveSession(sessionId, collectionId) {
   const client = await getClient();
-  const data = await client.graphql(MOVE_REPLAY_SESSION, { id: sessionId, collectionId });
+  const version = await client.getServerVersion();
+  const mutation = versionGte(version, CAIDO_V057) ? MOVE_REPLAY_SESSION_V057 : MOVE_REPLAY_SESSION;
+  const data = await client.graphql(mutation, { id: sessionId, collectionId });
   const session = requirePayload(data.moveReplaySession, "session", "moveReplaySession");
   printJson({ ...sessionOutput(session), moved: true });
 }
@@ -2226,20 +2243,91 @@ query ReplaySessionForSend($id: ID!) {
   }
 }`;
 
+const REPLAY_SESSION_META_INLINE_V057 = `
+  __typename
+  ... on ReplaySessionHttp {
+    id
+    name
+    collection { id }
+    activeEntry { id }
+  }
+  ... on ReplaySessionWs {
+    id
+    name
+    collection { id }
+    activeEntry { id }
+  }`;
+
+const REPLAY_ENTRY_HTTP_INLINE_V057 = `
+  __typename
+  ... on ReplayEntryHttp {
+    connection { ...ConnectionInfoFull }
+    createdAt
+    error
+    id
+    raw @include(if: $includeReplayRaw)
+    request { ...RequestFull }
+    session { id }
+  }`;
+
 const REPLAY_ENTRY_QUERY_V057 = `
 ${CONNECTION_FRAGMENT}
 ${REQUEST_FULL_FRAGMENT}
 query ReplayEntry($id: ID!, $sessionKind: ReplaySessionKind!, $includeReplayRaw: Boolean!, $includeRequestRaw: Boolean!, $includeResponseRaw: Boolean!) {
-  replayEntry(id: $id, sessionKind: $sessionKind) {
-    __typename
-    ... on ReplayEntryHttp {
-      connection { ...ConnectionInfoFull }
-      createdAt
-      error
-      id
-      raw @include(if: $includeReplayRaw)
-      request { ...RequestFull }
-      session { id }
+  replayEntry(id: $id, sessionKind: $sessionKind) {${REPLAY_ENTRY_HTTP_INLINE_V057}
+  }
+}`;
+
+const REPLAY_SESSION_QUERY_V057 = `
+query ReplaySession($id: ID!) {
+  replaySession(id: $id) {${REPLAY_SESSION_META_INLINE_V057}
+  }
+}`;
+
+const REPLAY_SESSIONS_QUERY_V057 = `
+query ReplaySessions($first: Int, $after: String, $last: Int, $before: String) {
+  replaySessions(first: $first, after: $after, last: $last, before: $before) {
+    edges { cursor node {${REPLAY_SESSION_META_INLINE_V057}
+    } }
+    pageInfo { hasNextPage hasPreviousPage startCursor endCursor }
+  }
+}`;
+
+const REPLAY_SESSION_ENTRIES_QUERY_V057 = `
+${CONNECTION_FRAGMENT}
+${REQUEST_FULL_FRAGMENT}
+query ReplaySessionEntries($id: ID!, $after: String, $before: String, $first: Int, $last: Int, $includeReplayRaw: Boolean!, $includeRequestRaw: Boolean!, $includeResponseRaw: Boolean!) {
+  replaySession(id: $id) {
+    ... on ReplaySessionHttp {
+      entries(after: $after, before: $before, first: $first, last: $last) {
+        edges { cursor node {${REPLAY_ENTRY_HTTP_INLINE_V057}
+        } }
+        pageInfo { hasNextPage hasPreviousPage startCursor endCursor }
+      }
+    }
+  }
+}`;
+
+const CREATE_REPLAY_SESSION_V057 = `
+mutation CreateReplaySession($input: CreateReplaySessionInput!) {
+  createReplaySession(input: $input) {
+    session {${REPLAY_SESSION_META_INLINE_V057}
+    }
+  }
+}`;
+
+const RENAME_REPLAY_SESSION_V057 = `
+mutation RenameReplaySession($id: ID!, $name: String!) {
+  renameReplaySession(id: $id, name: $name) {
+    session {${REPLAY_SESSION_META_INLINE_V057}
+    }
+  }
+}`;
+
+const MOVE_REPLAY_SESSION_V057 = `
+mutation MoveReplaySession($id: ID!, $collectionId: ID!) {
+  moveReplaySession(id: $id, collectionId: $collectionId) {
+    session {${REPLAY_SESSION_META_INLINE_V057}
     }
   }
 }`;
