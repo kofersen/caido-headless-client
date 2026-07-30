@@ -1804,6 +1804,69 @@ async function cmdEvidence(requestIdArg, opts) {
   printJson(compactUndefined({ requestId: request.id, findingId, outputDir: dir, files }));
 }
 
+/**
+ * Caido's own deduplicated view of what has been seen on a host, which is the
+ * coverage question ("which paths do I know here") answered without paging
+ * through history and deduplicating by hand.
+ */
+async function cmdSitemap(target, opts) {
+  const client = await getClient();
+  const scopeId = opts.scope ? await resolveScopeId(client, opts.scope) : undefined;
+  const roots = (await client.graphql(SITEMAP_ROOTS_QUERY, { scopeId })).sitemapRootEntries.edges.map((e) => e.node);
+
+  if (!target) {
+    const listed = roots.slice(0, opts.limit);
+    printJson(compactUndefined({
+      roots: listed.map((r) => compactUndefined({ id: r.id, label: r.label, kind: r.kind, hasDescendants: r.hasDescendants || undefined })),
+      count: listed.length,
+      total: roots.length,
+      truncated: roots.length > listed.length || undefined,
+    }));
+    return;
+  }
+
+  const root = roots.find((r) => r.id === target) || roots.find((r) => r.label === target);
+  if (!root) die(`No sitemap root matching "${target}". Run: caido-client.mjs sitemap`);
+
+  const depth = opts.all ? "ALL" : "DIRECT";
+  const nodes = (await client.graphql(SITEMAP_DESCENDANTS_QUERY, { parentId: root.id, depth })).sitemapDescendantEntries.edges.map((e) => e.node);
+
+  // Entries come back flat. Where a node has a request, that request's own path
+  // is authoritative — reconstructing from labels loses the distinction between
+  // /admin and /admin/, which are two different entries here. Only directories,
+  // which have no request, are rebuilt from the parent chain.
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const directoryPath = (node) => {
+    const parts = [];
+    let current = node;
+    while (current && current.id !== root.id) {
+      if (current.label) parts.unshift(current.label);
+      current = byId.get(current.parentId);
+    }
+    return `/${parts.join("/")}/`;
+  };
+
+  const entries = nodes
+    .map((n) => compactUndefined({
+      path: n.request?.path ?? directoryPath(n),
+      query: n.request?.query || undefined,
+      kind: n.kind,
+      method: n.request?.method,
+      requestId: n.request?.id,
+    }))
+    .sort((a, b) => a.path.localeCompare(b.path) || (a.query || "").localeCompare(b.query || ""));
+  const listed = entries.slice(0, opts.limit);
+
+  printJson(compactUndefined({
+    root: { id: root.id, label: root.label },
+    depth,
+    entries: listed,
+    count: listed.length,
+    total: entries.length,
+    truncated: entries.length > listed.length || undefined,
+  }));
+}
+
 function humanTamperName(typename, prefix) {
   return String(typename || "")
     .replace(prefix, "")
@@ -2741,6 +2804,21 @@ async function main() {
       await cmdCancelTask(args[1]);
       break;
     }
+    case "sitemap": {
+      const opts = { limit: 200, all: false };
+      let target;
+      for (let i = 1; i < args.length; i++) {
+        if (args[i] === "--scope") { opts.scope = requireFlagValue(args, i, "--scope"); i++; }
+        else if (args[i] === "--limit") {
+          opts.limit = parseInt(requireFlagValue(args, i, "--limit"), 10);
+          if (!Number.isFinite(opts.limit) || opts.limit <= 0) die("Error: --limit must be a positive integer");
+          i++;
+        } else if (args[i] === "--all") opts.all = true;
+        else if (!args[i].startsWith("--") && target === undefined) target = args[i];
+      }
+      await cmdSitemap(target, opts);
+      break;
+    }
     case "rules": await cmdRules(); break;
     case "intercept-status": await cmdInterceptStatus(); break;
     case "intercept-enable": await cmdInterceptSet(true); break;
@@ -3311,6 +3389,32 @@ const START_AUTOMATE_TASK = `
 mutation($automateSessionId: ID!) {
   startAutomateTask(automateSessionId: $automateSessionId) {
     automateTask { id paused }
+  }
+}`;
+
+const SITEMAP_ENTRY_FRAGMENT = `
+fragment SitemapEntryFull on SitemapEntry {
+  id
+  label
+  kind
+  parentId
+  hasDescendants
+  request { id method path query }
+}`;
+
+const SITEMAP_ROOTS_QUERY = `
+${SITEMAP_ENTRY_FRAGMENT}
+query SitemapRootEntries($scopeId: ID) {
+  sitemapRootEntries(scopeId: $scopeId) {
+    edges { node { ...SitemapEntryFull } }
+  }
+}`;
+
+const SITEMAP_DESCENDANTS_QUERY = `
+${SITEMAP_ENTRY_FRAGMENT}
+query SitemapDescendantEntries($parentId: ID!, $depth: SitemapDescendantsDepth!) {
+  sitemapDescendantEntries(parentId: $parentId, depth: $depth) {
+    edges { node { ...SitemapEntryFull } }
   }
 }`;
 
