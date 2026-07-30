@@ -152,6 +152,24 @@ Show all commands:
 node caido-client.mjs --help
 ```
 
+## Knowing What The Proxy Changed
+
+```bash
+node caido-client.mjs rules
+```
+
+Lists Caido's match-and-replace rules read-only: name, enabled, which part of the message the
+rule rewrites, its HTTPQL condition, and for header and body rules the matcher and the
+replacement. Rules apply to traffic this client never issued — a browser, a script, another
+tool — so without this their effects read as the target's own behaviour. An empty list is a
+useful answer.
+
+Every request and response also reports `alteration: TAMPER` when a rule changed it and
+`edited: true` when a person did. Neither field appears when there is nothing to report.
+
+Note that setting a header a rule also sets produces a doubled value, `x-foo: a, b`, not an
+override.
+
 ## Global Options
 
 | Flag | Description |

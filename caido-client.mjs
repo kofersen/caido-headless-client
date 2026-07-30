@@ -974,6 +974,17 @@ function applyRawEdits(raw, edits) {
   return [requestLine, ...headers].join(lineEnd) + separator + bodyPart;
 }
 
+/**
+ * Only surfaced when there is something to say: no `alteration` field means
+ * NONE, no `edited` means false. Documented, so absence is an answer too.
+ */
+function alterationFields(node) {
+  return {
+    alteration: node?.alteration && node.alteration !== "NONE" ? node.alteration : undefined,
+    edited: node?.edited || undefined,
+  };
+}
+
 function requestOutput(node, opts, includeResponse = true) {
   if (!node) return undefined;
   const output = {
@@ -984,6 +995,7 @@ function requestOutput(node, opts, includeResponse = true) {
     port: node.port,
     isTls: node.isTls,
     createdAt: node.createdAt,
+    ...alterationFields(node),
   };
   if (!opts.noRequest && node.raw) output.raw = formatHttpRaw(decodeRaw(node.raw), opts);
   if (includeResponse && node.response) {
@@ -997,6 +1009,7 @@ function responseOutput(response, opts) {
     statusCode: response.statusCode,
     roundtrip: response.roundtripTime,
     length: response.length,
+    ...alterationFields(response),
   };
   if (response.raw) output.raw = formatHttpRaw(decodeRaw(response.raw), opts);
   return output;
@@ -1290,6 +1303,7 @@ async function cmdSearch(filter, limit, after, idsOnly, desc, scope) {
     roundtrip: e.node.response?.roundtripTime,
     responseLength: e.node.response?.length,
     createdAt: e.node.createdAt,
+    ...alterationFields(e.node),
     cursor: e.cursor,
   }));
   printJson({ results, pageInfo: data.requests.pageInfo, count: results.length });
@@ -1790,6 +1804,71 @@ async function cmdEvidence(requestIdArg, opts) {
   printJson(compactUndefined({ requestId: request.id, findingId, outputDir: dir, files }));
 }
 
+function humanTamperName(typename, prefix) {
+  return String(typename || "")
+    .replace(prefix, "")
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .toLowerCase() || undefined;
+}
+
+function tamperMatcher(matcher) {
+  if (!matcher) return undefined;
+  if (matcher.name !== undefined) return { name: matcher.name };
+  if (matcher.value !== undefined) return { value: matcher.value };
+  if (matcher.regex !== undefined) return { regex: matcher.regex };
+  if (matcher.full !== undefined) return { full: matcher.full };
+  return { kind: matcher.__typename };
+}
+
+function tamperReplacer(replacer) {
+  if (!replacer) return undefined;
+  if (replacer.term !== undefined) return { term: replacer.term };
+  if (replacer.__typename === "TamperReplacerWorkflow") return { workflowId: replacer.id };
+  return { kind: replacer.__typename };
+}
+
+/**
+ * Lists Caido's match-and-replace rules. Read-only and deliberately literal:
+ * what a rule does to traffic is the caller's conclusion, not this command's.
+ * An empty list is a useful answer too - it rules the explanation out.
+ */
+async function cmdRules() {
+  const data = await (await getClient()).graphql(TAMPER_RULES_QUERY, {});
+  let total = 0;
+  let enabled = 0;
+
+  const collections = (data.tamperRuleCollections || []).map((collection) => ({
+    id: collection.id,
+    name: collection.name,
+    rules: (collection.rules || []).map((rule) => {
+      total++;
+      // A rank is what Caido stores for an active rule; null means switched off.
+      const isEnabled = !!rule.enable;
+      if (isEnabled) enabled++;
+      const operation = rule.section?.operation;
+      return compactUndefined({
+        id: rule.id,
+        name: rule.name,
+        enabled: isEnabled,
+        section: humanTamperName(rule.section?.__typename, "TamperSection"),
+        condition: rule.condition?.code || undefined,
+        operation: operation ? humanTamperName(operation.__typename, /^TamperOperation(Header|Body)/) : undefined,
+        matcher: tamperMatcher(operation?.matcher),
+        replacer: tamperReplacer(operation?.replacer),
+      });
+    }),
+  }));
+
+  printJson({
+    collections,
+    total,
+    enabled,
+    note: enabled
+      ? "Enabled rules rewrite traffic before it reaches the target or you. Requests they touched carry alteration: TAMPER."
+      : "No enabled rules; traffic is not being rewritten by match-and-replace.",
+  });
+}
+
 async function cmdGetSession(sessionIdOrName, opts) {
   const client = await getClient();
   const session = await resolveSession(client, sessionIdOrName);
@@ -2243,6 +2322,7 @@ Sessions and collections:
   delete-collection <id>
 
 Other:
+  rules                   list match-and-replace rules rewriting traffic
   findings | get-finding | create-finding | update-finding
   scopes | create-scope | update-scope | delete-scope
   filters | create-filter | update-filter | delete-filter
@@ -2661,6 +2741,7 @@ async function main() {
       await cmdCancelTask(args[1]);
       break;
     }
+    case "rules": await cmdRules(); break;
     case "intercept-status": await cmdInterceptStatus(); break;
     case "intercept-enable": await cmdInterceptSet(true); break;
     case "intercept-disable": await cmdInterceptSet(false); break;
@@ -2682,6 +2763,9 @@ async function main() {
   }
 }
 
+// alteration and edited answer "did something rewrite this before I saw it":
+// TAMPER means a match-and-replace rule changed it, MANUAL means a person did.
+// Without them a rule's effect reads as the target's own behaviour.
 const REQUEST_FULL_FRAGMENT = `
 fragment ResponseFull on Response {
   id
@@ -2689,6 +2773,8 @@ fragment ResponseFull on Response {
   roundtripTime
   length
   createdAt
+  alteration
+  edited
   raw @include(if: $includeResponseRaw)
 }
 fragment RequestFull on Request {
@@ -2700,6 +2786,8 @@ fragment RequestFull on Request {
   query
   isTls
   createdAt
+  alteration
+  edited
   raw @include(if: $includeRequestRaw)
   response {
     ...ResponseFull
@@ -3223,6 +3311,57 @@ const START_AUTOMATE_TASK = `
 mutation($automateSessionId: ID!) {
   startAutomateTask(automateSessionId: $automateSessionId) {
     automateTask { id paused }
+  }
+}`;
+
+// Match-and-replace rules rewrite traffic the client never issued, so their
+// effects otherwise read as the target's behaviour. Header and body operations
+// are reported in full because those change meaning silently; the remaining
+// sections report which part they rewrite.
+const TAMPER_RULES_QUERY = `
+fragment MatcherRawFull on TamperMatcherRaw {
+  __typename
+  ... on TamperMatcherValue { value }
+  ... on TamperMatcherRegex { regex }
+  ... on TamperMatcherFull { full }
+}
+fragment ReplacerFull on TamperReplacer {
+  __typename
+  ... on TamperReplacerTerm { term }
+  ... on TamperReplacerWorkflow { id }
+}
+fragment HeaderOperation on TamperOperationHeader {
+  __typename
+  ... on TamperOperationHeaderRaw { matcher { ...MatcherRawFull } replacer { ...ReplacerFull } }
+  ... on TamperOperationHeaderAdd { matcher { name } replacer { ...ReplacerFull } }
+  ... on TamperOperationHeaderUpdate { matcher { name } replacer { ...ReplacerFull } }
+  ... on TamperOperationHeaderRemove { matcher { name } }
+}
+fragment BodyOperation on TamperOperationBody {
+  __typename
+  ... on TamperOperationBodyRaw { matcher { ...MatcherRawFull } replacer { ...ReplacerFull } }
+}
+query TamperRules {
+  tamperRuleCollections {
+    id
+    name
+    rules {
+      id
+      name
+      enable { rank }
+      condition {
+        __typename
+        ... on HTTPQL { code }
+        ... on StreamQL { code }
+      }
+      section {
+        __typename
+        ... on TamperSectionRequestHeader { operation { ...HeaderOperation } }
+        ... on TamperSectionResponseHeader { operation { ...HeaderOperation } }
+        ... on TamperSectionRequestBody { operation { ...BodyOperation } }
+        ... on TamperSectionResponseBody { operation { ...BodyOperation } }
+      }
+    }
   }
 }`;
 
