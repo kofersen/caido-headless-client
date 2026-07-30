@@ -2385,6 +2385,7 @@ Sessions and collections:
   delete-collection <id>
 
 Other:
+  sitemap [host] [--scope s] [--all] [--limit n]   what has been seen on a host
   rules                   list match-and-replace rules rewriting traffic
   findings | get-finding | create-finding | update-finding
   scopes | create-scope | update-scope | delete-scope
