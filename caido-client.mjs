@@ -1804,10 +1804,10 @@ async function cmdEvidence(requestIdArg, opts) {
   printJson(compactUndefined({ requestId: request.id, findingId, outputDir: dir, files }));
 }
 
-async function cmdStreams(limit, scope) {
+async function cmdStreams(limit, scope, filter) {
   const client = await getClient();
   const scopeId = scope ? await resolveScopeId(client, scope) : undefined;
-  const data = await client.graphql(STREAMS_QUERY, { first: limit, scopeId });
+  const data = await client.graphql(STREAMS_QUERY, { first: limit, scopeId, filter: filter ? { code: filter } : undefined });
   const results = data.streams.edges.map((e) => compactUndefined({
     id: e.node.id,
     protocol: e.node.protocol,
@@ -1823,9 +1823,14 @@ async function cmdStreams(limit, scope) {
   printJson({ results, pageInfo: data.streams.pageInfo, count: results.length });
 }
 
-async function cmdStreamMessages(streamId, limit, includeRaw, opts) {
+async function cmdStreamMessages(streamId, limit, includeRaw, filter, opts) {
   const client = await getClient();
-  const data = await client.graphql(STREAM_MESSAGES_QUERY, { streamId, first: limit, includeRaw });
+  const data = await client.graphql(STREAM_MESSAGES_QUERY, {
+    streamId,
+    first: limit,
+    includeRaw,
+    filter: filter ? { code: filter } : undefined,
+  });
   const results = data.streamWsMessages.edges.map((e) => {
     const head = e.node.head || {};
     const row = compactUndefined({
@@ -2431,8 +2436,8 @@ Sessions and collections:
 
 Other:
   sitemap [host] [--scope s] [--all] [--limit n]   what has been seen on a host
-  streams [--limit n] [--scope s]                 WebSocket and SSE streams
-  stream-messages <stream-id> [--limit n] [--raw] [output options]
+  streams [--limit n] [--scope s] [--filter streamql]
+  stream-messages <stream-id> [--limit n] [--raw] [--filter streamql] [output options]
   rules                   list match-and-replace rules rewriting traffic
   findings | get-finding | create-finding | update-finding
   scopes | create-scope | update-scope | delete-scope
@@ -2855,24 +2860,28 @@ async function main() {
     case "streams": {
       let limit = 20;
       let scope;
+      let filter;
       for (let i = 1; i < args.length; i++) {
         if (args[i] === "--limit") { limit = parseInt(requireFlagValue(args, i, "--limit"), 10); i++; }
         else if (args[i] === "--scope") { scope = requireFlagValue(args, i, "--scope"); i++; }
+        else if (args[i] === "--filter") { filter = requireFlagValue(args, i, "--filter"); i++; }
       }
       if (!Number.isFinite(limit) || limit <= 0) die("Error: --limit must be a positive integer");
-      await cmdStreams(limit, scope);
+      await cmdStreams(limit, scope, filter);
       break;
     }
     case "stream-messages": {
       if (!args[1]) die("Error: stream id required");
       let limit = 50;
       let includeRaw = false;
+      let filter;
       for (let i = 2; i < args.length; i++) {
         if (args[i] === "--limit") { limit = parseInt(requireFlagValue(args, i, "--limit"), 10); i++; }
+        else if (args[i] === "--filter") { filter = requireFlagValue(args, i, "--filter"); i++; }
         else if (args[i] === "--raw") includeRaw = true;
       }
       if (!Number.isFinite(limit) || limit <= 0) die("Error: --limit must be a positive integer");
-      await cmdStreamMessages(args[1], limit, includeRaw, parseOutputOpts(args, 2));
+      await cmdStreamMessages(args[1], limit, includeRaw, filter, parseOutputOpts(args, 2));
       break;
     }
     case "sitemap": {
@@ -3466,8 +3475,8 @@ mutation($automateSessionId: ID!) {
 // WebSocket and SSE traffic lives outside the request tables entirely, so
 // search and recent are blind to it: a stream is not a request.
 const STREAMS_QUERY = `
-query Streams($first: Int, $after: String, $scopeId: ID) {
-  streams(first: $first, after: $after, scopeId: $scopeId) {
+query Streams($first: Int, $after: String, $scopeId: ID, $filter: StreamQLInput) {
+  streams(first: $first, after: $after, scopeId: $scopeId, filter: $filter) {
     edges {
       cursor
       node { id host port path isTls direction source protocol createdAt }
@@ -3477,8 +3486,8 @@ query Streams($first: Int, $after: String, $scopeId: ID) {
 }`;
 
 const STREAM_MESSAGES_QUERY = `
-query StreamWsMessages($streamId: ID, $first: Int, $after: String, $includeRaw: Boolean!) {
-  streamWsMessages(streamId: $streamId, first: $first, after: $after) {
+query StreamWsMessages($streamId: ID, $first: Int, $after: String, $includeRaw: Boolean!, $filter: StreamQLInput) {
+  streamWsMessages(streamId: $streamId, first: $first, after: $after, filter: $filter) {
     edges {
       cursor
       node {
