@@ -17,7 +17,7 @@
  * Last verified 2026-07-30 against sdk-client 0.5.0.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, resolve, join } from "node:path";
@@ -26,6 +26,7 @@ const DEBUG = process.env.DEBUG === "1";
 const DEFAULT_CAIDO_URL = "http://localhost:8080";
 const DEFAULT_CLOUD_API_URL = "https://api.caido.io";
 const SECRETS_PATH = join(homedir(), ".claude", "config", "secrets.json");
+const STATE_PATH = join(homedir(), ".claude", "config", "caido-state.json");
 
 const DEFAULT_OUTPUT_OPTS = {
   maxBodyLines: 200,
@@ -34,13 +35,81 @@ const DEFAULT_OUTPUT_OPTS = {
   headersOnly: false,
 };
 
+// Two retries at these delays; a third would outlast the 30s GraphQL timeout
+// it is meant to paper over.
+const RETRY_DELAYS_MS = [300, 900];
+
+// Batch sends pace themselves even when no delay was asked for: a rate-limited
+// response teaches the caller the wrong thing about the target.
+const DEFAULT_BATCH_DELAY_MS = 250;
+
+// Refuse absurd --values lists rather than hammering a target by typo.
+const MAX_BATCH_VALUES = 1000;
+
+// A pace, not a pause: past this a caller wants a different command, and huge
+// values only invite timer overflow.
+const MAX_DELAY_MS = 300_000;
+
+// Response headers that differ on every response and would otherwise fill the
+// compare output with noise. --all-headers keeps them.
+const VOLATILE_HEADERS = new Set([
+  "date",
+  "age",
+  "cf-ray",
+  "x-request-id",
+  "x-amz-cf-id",
+  "x-amz-request-id",
+  "report-to",
+  "nel",
+  "alt-svc",
+  "server-timing",
+]);
+
 function die(message, code = 1) {
   console.error(message);
   process.exit(code);
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function globalFlagValue(name) {
+  const argv = process.argv.slice(2);
+  const idx = argv.indexOf(name);
+  return idx >= 0 ? argv[idx + 1] : undefined;
+}
+
+/**
+ * Value for a flag that must have one. None of these flags take a value
+ * starting with `--`, so swallowing the next flag is always a typo — and a
+ * silent one: `evidence 1 --out --force` would write into a directory named
+ * `--force`, and `edit 1 --values --compact` would send `--compact` as a value.
+ */
+function requireFlagValue(args, idx, name) {
+  const value = args[idx + 1];
+  if (value === undefined || value === "" || value.startsWith("--")) {
+    die(`Error: ${name} needs a value`);
+  }
+  return value;
+}
+
+const COMPACT_JSON = process.env.CAIDO_COMPACT_JSON === "1" || process.argv.slice(2).includes("--json-compact");
+
+// Minimum gap between two outbound sends to the same host, best-effort across
+// processes. null when not asked for, which is distinct from an explicit 0:
+// `--delay 0` has to be able to switch off the batch default.
+const MIN_INTERVAL_MS = (() => {
+  const raw = globalFlagValue("--delay") ?? process.env.CAIDO_MIN_INTERVAL_MS;
+  if (raw === undefined) return null;
+  const ms = parseInt(raw, 10);
+  if (!Number.isFinite(ms) || ms < 0) die("Error: --delay / CAIDO_MIN_INTERVAL_MS must be a non-negative integer (milliseconds)");
+  if (ms > MAX_DELAY_MS) die(`Error: --delay / CAIDO_MIN_INTERVAL_MS above ${MAX_DELAY_MS}ms is not a pace, it is a stop`);
+  return ms;
+})();
+
 function printJson(value) {
-  console.log(JSON.stringify(value, null, 2));
+  console.log(COMPACT_JSON ? JSON.stringify(value) : JSON.stringify(value, null, 2));
 }
 
 function compactUndefined(value) {
@@ -163,6 +232,69 @@ function isCachedTokenValid(token) {
   return Number.isFinite(exp) && exp > Date.now() + 30_000;
 }
 
+// Send pacing lives beside the secrets file but never in it: this holds
+// timestamps, not credentials, and separate processes have to see each other's.
+function readStateFile() {
+  if (!existsSync(STATE_PATH)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(STATE_PATH, "utf-8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+// Falls back to this when the state file cannot be written, so pacing inside one
+// process survives a read-only config directory.
+const lastSendByHost = new Map();
+
+function writeStateFile(state) {
+  const dir = dirname(STATE_PATH);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try {
+    writeFileSync(STATE_PATH, JSON.stringify(state), { mode: 0o600 });
+  } catch (err) {
+    if (DEBUG) console.error(`State file write failed: ${err.message}`);
+  }
+}
+
+/**
+ * Wait until at least minIntervalMs has passed since the last send to this
+ * host. Best-effort: two processes racing can both read the same timestamp,
+ * which costs one unpaced request rather than a lock.
+ */
+async function throttleHost(host, minIntervalMs) {
+  if (!minIntervalMs || !host) return;
+  const key = `lastSend:${host}`;
+  const state = readStateFile();
+  const persisted = Number(state[key]);
+  const inMemory = lastSendByHost.get(host);
+  const last = Math.max(Number.isFinite(persisted) ? persisted : 0, inMemory ?? 0);
+  const waitMs = last ? last + minIntervalMs - Date.now() : 0;
+  if (waitMs > 0) await sleep(Math.min(waitMs, minIntervalMs));
+  const now = Date.now();
+  lastSendByHost.set(host, now);
+  state[key] = now;
+  writeStateFile(state);
+}
+
+/**
+ * Anywhere in the document, not just at line start: several operations here are
+ * built as `${FRAGMENT} mutation Name(...)` on one line, and treating those as
+ * reads would let a retry create a scope or switch a project twice.
+ * A query misread as a mutation only loses its retry, so err that way.
+ */
+function isReadOnlyDocument(query) {
+  return !/\bmutation\b/.test(query);
+}
+
+function isTransientError(err) {
+  if (err?.status === 502 || err?.status === 503 || err?.status === 504) return true;
+  if (err?.name === "TimeoutError" || err?.name === "AbortError") return true;
+  const text = String(err?.message || "").toLowerCase();
+  return text.includes("fetch failed") || text.includes("econnreset") || text.includes("socket hang up");
+}
+
 async function rawGraphql(url, query, variables = {}, accessToken, timeoutMs = 30_000) {
   const headers = {
     "content-type": "application/json",
@@ -182,7 +314,10 @@ async function rawGraphql(url, query, variables = {}, accessToken, timeoutMs = 3
   try {
     payload = text ? JSON.parse(text) : {};
   } catch {
-    throw new Error(`GraphQL returned non-JSON response (${response.status}): ${text.slice(0, 300)}`);
+    // Carries the status so a proxy's HTML 502/503 page still reads as transient.
+    const err = new Error(`GraphQL returned non-JSON response (${response.status}): ${text.slice(0, 300)}`);
+    err.status = response.status;
+    throw err;
   }
 
   if (!response.ok) {
@@ -501,7 +636,25 @@ class CaidoClient {
     this.refreshToken = refreshToken;
   }
 
+  /**
+   * Reads retry on transient transport failures; mutations never do. Resending
+   * a replay mutation after an ambiguous failure would put a second request on
+   * the target, which is not a cost this client gets to decide to pay.
+   */
   async graphql(query, variables = {}) {
+    const retriable = isReadOnlyDocument(query);
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.graphqlOnce(query, variables);
+      } catch (err) {
+        if (!retriable || attempt >= RETRY_DELAYS_MS.length || !isTransientError(err)) throw err;
+        if (DEBUG) console.error(`Transient GraphQL failure (${err.message}), retrying in ${RETRY_DELAYS_MS[attempt]}ms`);
+        await sleep(RETRY_DELAYS_MS[attempt]);
+      }
+    }
+  }
+
+  async graphqlOnce(query, variables = {}) {
     try {
       return await rawGraphql(this.url, query, variables, this.token);
     } catch (err) {
@@ -630,14 +783,33 @@ function splitHttpRawBytes(raw) {
   throw new Error("Could not find HTTP header/body separator in raw data");
 }
 
-function writeBinaryFile(filePath, data, force) {
+function writeBinaryFile(filePath, data, force, mode) {
   const absolutePath = resolve(filePath);
-  if (existsSync(absolutePath) && !force) {
-    die(`Error: ${absolutePath} already exists. Pass --force to overwrite.`);
-  }
+  assertWritableTarget(absolutePath, force);
   mkdirSync(dirname(absolutePath), { recursive: true, mode: 0o700 });
-  writeFileSync(absolutePath, data);
+  writeFileSync(absolutePath, data, mode === undefined ? undefined : { mode });
+  if (mode !== undefined) {
+    try {
+      chmodSync(absolutePath, mode);
+    } catch {}
+  }
   return absolutePath;
+}
+
+/**
+ * Refuses to clobber an existing file without --force, and refuses a symlink
+ * even with it: --force is permission to overwrite the named file, not to
+ * follow a link and write somewhere else entirely.
+ */
+function assertWritableTarget(absolutePath, force) {
+  let stat;
+  try {
+    stat = lstatSync(absolutePath);
+  } catch {
+    return;
+  }
+  if (stat.isSymbolicLink()) die(`Error: ${absolutePath} is a symlink; refusing to write through it.`);
+  if (!force) die(`Error: ${absolutePath} already exists. Pass --force to overwrite.`);
 }
 
 function extractHeaders(decoded) {
@@ -896,7 +1068,11 @@ function buildReplayOutput(sessionId, result, opts, modifiedRaw) {
   if (result.entry) {
     output.entryId = result.entry.id;
     if (result.entry.request) output.requestId = result.entry.request.id;
-    if (result.entry.request?.response) output.response = responseOutput(result.entry.request.response, opts);
+    if (result.entry.request?.response) {
+      output.response = responseOutput(result.entry.request.response, opts);
+      const backoff = backoffInfo(result.entry.request.response);
+      if (backoff) output.backoff = backoff;
+    }
   }
   return output;
 }
@@ -952,12 +1128,36 @@ async function getReplayEntry(client, id, includeReplayRaw = true, includeReques
   return data.replayEntry;
 }
 
-async function sendReplay(client, sessionId, raw, connection) {
+async function sendReplay(client, sessionId, raw, connection, { minIntervalMs = MIN_INTERVAL_MS ?? 0 } = {}) {
+  await throttleHost(connection?.host, minIntervalMs);
   const version = await client.getServerVersion();
   if (versionGte(version, CAIDO_V057)) {
     return sendReplayV057(client, sessionId, raw, connection);
   }
   return sendReplayV056(client, sessionId, raw, connection);
+}
+
+/**
+ * Backoff signals the caller must not read as a normal result: a 429 recorded
+ * as "blocked" is a wrong verdict that outlives the request. Each reason is
+ * named rather than collapsed, because a bare 503 is an unavailable service and
+ * a challenge is a bot check — different conclusions about the target.
+ */
+function backoffInfo(response) {
+  if (!response) return undefined;
+  const code = response.statusCode;
+  const headers = response.raw ? extractHeaders(decodeRaw(response.raw)) : "";
+  const retryAfter = headers.match(/^retry-after:[ \t]*(.+)$/im)?.[1]?.trim();
+  const challenged = /^cf-mitigated:/im.test(headers);
+
+  let reason;
+  if (code === 429) reason = "rate-limited";
+  else if (challenged) reason = "challenge";
+  else if (code === 503) reason = "service-unavailable";
+  else if (retryAfter) reason = "retry-after";
+  if (!reason) return undefined;
+
+  return compactUndefined({ reason, statusCode: code, retryAfter, challenge: challenged || undefined });
 }
 
 async function sendReplayV056(client, sessionId, raw, connection) {
@@ -1053,13 +1253,23 @@ async function resolveSession(client, idOrName) {
   return undefined;
 }
 
-async function cmdSearch(filter, limit, after, idsOnly, desc) {
+/** Accepts a scope id or its name, so callers do not have to look the id up first. */
+async function resolveScopeId(client, idOrName) {
+  const scopes = (await client.graphql(SCOPES_QUERY, {})).scopes || [];
+  const match = scopes.find((s) => s.id === idOrName) || scopes.find((s) => s.name === idOrName);
+  if (!match) die(`Scope "${idOrName}" not found. Run: caido-client.mjs scopes`);
+  return match.id;
+}
+
+async function cmdSearch(filter, limit, after, idsOnly, desc, scope) {
   const client = await getClient();
+  const scopeId = scope ? await resolveScopeId(client, scope) : undefined;
   const data = await client.graphql(REQUESTS_QUERY, {
     first: limit,
     after,
     filter: filter ? { code: filter } : undefined,
     order: desc ? { by: "ID", ordering: "DESC" } : undefined,
+    scopeId,
     includeRequestRaw: false,
     includeResponseRaw: false,
   });
@@ -1202,6 +1412,382 @@ async function cmdEdit(requestId, edits, opts, overrides, collectionId) {
   const connection = buildConnection(original.host, original.port, original.isTls, overrides);
   const result = await sendReplay(client, session.id, modifiedRaw, connection);
   printJson(buildReplayOutput(session.id, result, opts, modifiedRaw));
+}
+
+const VALUE_PLACEHOLDER = "{}";
+
+function parseValueSpec(spec) {
+  if (spec.startsWith("@")) {
+    const path = resolve(spec.slice(1));
+    if (!existsSync(path)) die(`Error: values file ${path} not found`);
+    return readFileSync(path, "utf-8").split("\n").map((line) => line.trim()).filter(Boolean);
+  }
+  const range = spec.match(/^(\d+)-(\d+)$/);
+  if (range) {
+    const from = Number(range[1]);
+    const to = Number(range[2]);
+    // Size-check the range before expanding it: 1-1000000000 would otherwise
+    // exhaust memory before reaching the cap, and endpoints past the safe
+    // integer limit never terminate the loop.
+    if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to)) die("Error: --values range endpoints are too large");
+    if (to < from) die("Error: --values range must ascend, e.g. 1-100");
+    if (to - from + 1 > MAX_BATCH_VALUES) die(`Error: --values range covers ${to - from + 1} entries, over the ${MAX_BATCH_VALUES} cap`);
+    const values = [];
+    for (let n = from; n <= to; n++) values.push(String(n));
+    return values;
+  }
+  return spec.split(",").map((value) => value.trim()).filter(Boolean);
+}
+
+function substituteEdits(edits, value) {
+  const sub = (text) => (typeof text === "string" ? text.split(VALUE_PLACEHOLDER).join(value) : text);
+  return {
+    ...edits,
+    method: sub(edits.method),
+    path: sub(edits.path),
+    body: sub(edits.body),
+    setHeaders: edits.setHeaders.map(sub),
+    replacements: edits.replacements.map(sub),
+  };
+}
+
+function editsContainPlaceholder(edits) {
+  const fields = [edits.method, edits.path, edits.body, ...edits.setHeaders, ...edits.replacements];
+  return fields.some((field) => typeof field === "string" && field.includes(VALUE_PLACEHOLDER));
+}
+
+/**
+ * Send one edited request per value through a single replay session, reporting
+ * a row each instead of full bodies. Stops on the first backoff signal or send
+ * error rather than working through the rest of the list against a target that
+ * has started refusing.
+ */
+async function cmdEditBatch(requestId, edits, values, opts, overrides, collectionId, delayMs) {
+  if (!editsContainPlaceholder(edits)) {
+    die(`Error: --values needs a ${VALUE_PLACEHOLDER} placeholder in --method, --path, --body, --set-header or --replace`);
+  }
+  if (!values.length) die("Error: --values resolved to no values");
+  if (values.length > MAX_BATCH_VALUES) die(`Error: --values holds ${values.length} entries, over the ${MAX_BATCH_VALUES} cap`);
+
+  const client = await getClient();
+  const original = await getRequest(client, requestId, true, false);
+  if (!original) die(`Request ${requestId} not found`);
+  const raw = decodeRaw(original.raw);
+  if (!raw) die("No raw data for this request");
+
+  const session = edits.sessionId
+    ? { id: edits.sessionId }
+    : await createReplaySession(client, { id: requestId }, collectionId);
+  const connection = buildConnection(original.host, original.port, original.isTls, overrides);
+
+  const results = [];
+  let stopped;
+  for (const value of values) {
+    const modifiedRaw = applyRawEdits(raw, substituteEdits(edits, value));
+    let result;
+    try {
+      result = await sendReplay(client, session.id, modifiedRaw, connection, { minIntervalMs: delayMs });
+    } catch (err) {
+      stopped = `send failed at "${value}": ${err.message}`;
+      break;
+    }
+    const response = result.entry?.request?.response;
+    const backoff = backoffInfo(response);
+    results.push(compactUndefined({
+      value,
+      status: result.status,
+      statusCode: response?.statusCode,
+      length: response?.length,
+      roundtrip: response?.roundtripTime,
+      requestId: result.entry?.request?.id,
+      entryId: result.entry?.id,
+      error: result.error ? String(result.error.code || result.error) : undefined,
+      backoff,
+    }));
+    // Any backoff reason ends the run: a challenge or an unavailable service is
+    // as much a reason to stop sending as a 429, and the remaining values would
+    // only produce more of the same wrong answer.
+    if (backoff) {
+      stopped = `${backoff.reason} at "${value}"`;
+      break;
+    }
+    if (result.error) {
+      stopped = `replay error at "${value}"`;
+      break;
+    }
+  }
+
+  printJson(compactUndefined({
+    sessionId: session.id,
+    requested: values.length,
+    sent: results.length,
+    delayMs,
+    stopped,
+    results,
+  }));
+}
+
+function parseHeaderMap(rawText) {
+  const map = new Map();
+  const lines = extractHeaders(rawText).split(/\r?\n/).slice(1);
+  for (const line of lines) {
+    const idx = line.indexOf(":");
+    if (idx <= 0) continue;
+    const name = line.slice(0, idx).trim().toLowerCase();
+    const value = line.slice(idx + 1).trim();
+    // Repeated names (Set-Cookie) keep every value, so a dropped cookie shows up.
+    map.set(name, map.has(name) ? `${map.get(name)}, ${value}` : value);
+  }
+  return map;
+}
+
+/** Body bytes, or an empty buffer when the message carries no separator. */
+function splitBodyBytes(bytes) {
+  try {
+    return splitHttpRawBytes(bytes).body;
+  } catch {
+    return Buffer.alloc(0);
+  }
+}
+
+function diffHeaders(aMap, bMap, allHeaders) {
+  const onlyInA = [];
+  const onlyInB = [];
+  const changed = [];
+  const ignored = [];
+  for (const name of [...new Set([...aMap.keys(), ...bMap.keys()])].sort()) {
+    const a = aMap.get(name);
+    const b = bMap.get(name);
+    if (a === b) continue;
+    if (!allHeaders && VOLATILE_HEADERS.has(name)) {
+      ignored.push(name);
+    } else if (a === undefined) {
+      onlyInB.push(name);
+    } else if (b === undefined) {
+      onlyInA.push(name);
+    } else {
+      changed.push({ name, a, b });
+    }
+  }
+  return compactUndefined({
+    onlyInA: onlyInA.length ? onlyInA : undefined,
+    onlyInB: onlyInB.length ? onlyInB : undefined,
+    changed: changed.length ? changed : undefined,
+    ignored: ignored.length ? ignored : undefined,
+  });
+}
+
+function truncateLine(line, maxChars) {
+  if (line.length <= maxChars) return line;
+  return `${line.slice(0, maxChars)}…[+${line.length - maxChars} chars]`;
+}
+
+/**
+ * Minified bodies arrive as one line thousands of characters wide, where the
+ * head is identical boilerplate and the difference sits in the middle. Window
+ * around the first differing character instead of printing the head.
+ */
+function charWindow(a, b, maxChars) {
+  let offset = 0;
+  while (offset < a.length && offset < b.length && a[offset] === b[offset]) offset++;
+  const from = Math.max(0, offset - Math.floor(maxChars / 2));
+  const cut = (text) => {
+    const head = from > 0 ? `…[${from} identical chars]` : "";
+    const tail = from + maxChars < text.length ? `…[+${text.length - from - maxChars} chars]` : "";
+    return `${head}${text.slice(from, from + maxChars)}${tail}`;
+  };
+  return { firstDiffOffset: offset, a: cut(a), b: cut(b) };
+}
+
+/**
+ * Common prefix and suffix are trimmed and the differing middle reported.
+ * Cheaper than a real diff and enough to answer the question the caller has:
+ * did this response change, and where.
+ */
+function diffLines(aText, bText, maxLines, maxLineChars) {
+  const a = aText.split("\n");
+  const b = bText.split("\n");
+  let prefix = 0;
+  while (prefix < a.length && prefix < b.length && a[prefix] === b[prefix]) prefix++;
+  let suffix = 0;
+  while (
+    suffix < a.length - prefix &&
+    suffix < b.length - prefix &&
+    a[a.length - 1 - suffix] === b[b.length - 1 - suffix]
+  ) suffix++;
+
+  const aDiff = a.slice(prefix, a.length - suffix);
+  const bDiff = b.slice(prefix, b.length - suffix);
+  const longest = Math.max(a.length, b.length);
+  const identical = aDiff.length === 0 && bDiff.length === 0;
+
+  const wide = aDiff.length === 1 && bDiff.length === 1 &&
+    (aDiff[0].length > maxLineChars || bDiff[0].length > maxLineChars);
+  const window = wide ? charWindow(aDiff[0], bDiff[0], maxLineChars) : undefined;
+
+  return compactUndefined({
+    identical,
+    similarity: longest === 0 ? 1 : Math.round(((prefix + suffix) / longest) * 100) / 100,
+    linesA: a.length,
+    linesB: b.length,
+    firstDiffLine: identical ? undefined : prefix + 1,
+    firstDiffOffset: window?.firstDiffOffset,
+    differingLinesA: aDiff.length || undefined,
+    differingLinesB: bDiff.length || undefined,
+    truncated: aDiff.length > maxLines || bDiff.length > maxLines || undefined,
+    a: window ? [window.a] : aDiff.length ? aDiff.slice(0, maxLines).map((line) => truncateLine(line, maxLineChars)) : undefined,
+    b: window ? [window.b] : bDiff.length ? bDiff.slice(0, maxLines).map((line) => truncateLine(line, maxLineChars)) : undefined,
+  });
+}
+
+async function cmdCompare(idA, idB, opts) {
+  const client = await getClient();
+  const useRequest = opts.source === "request";
+  const [a, b] = await Promise.all([
+    getRequest(client, idA, useRequest, !useRequest),
+    getRequest(client, idB, useRequest, !useRequest),
+  ]);
+  if (!a) die(`Request ${idA} not found`);
+  if (!b) die(`Request ${idB} not found`);
+
+  const summarize = (request) => compactUndefined({
+    id: request.id,
+    method: request.method,
+    host: request.host,
+    path: request.path,
+    statusCode: request.response?.statusCode,
+    length: request.response?.length,
+    roundtrip: request.response?.roundtripTime,
+  });
+
+  const output = { comparing: useRequest ? "request" : "response", a: summarize(a), b: summarize(b) };
+
+  if (!useRequest) {
+    const codeA = a.response?.statusCode;
+    const codeB = b.response?.statusCode;
+    const lenA = a.response?.length;
+    const lenB = b.response?.length;
+    output.status = { same: codeA === codeB, a: codeA, b: codeB };
+    output.length = compactUndefined({
+      same: lenA === lenB,
+      a: lenA,
+      b: lenB,
+      delta: Number.isFinite(lenA) && Number.isFinite(lenB) ? lenB - lenA : undefined,
+    });
+  }
+
+  const bytesOf = (request) => {
+    const raw = useRequest ? request.raw : request.response?.raw;
+    return raw ? rawToBuffer(raw) : undefined;
+  };
+  const bytesA = bytesOf(a);
+  const bytesB = bytesOf(b);
+  if (bytesA === undefined || bytesB === undefined) {
+    output.error = `No ${useRequest ? "request" : "response"} raw data for ${bytesA === undefined ? idA : idB}`;
+    printJson(compactUndefined(output));
+    return;
+  }
+
+  const rawA = bytesA.toString("utf-8");
+  const rawB = bytesB.toString("utf-8");
+  output.headers = diffHeaders(parseHeaderMap(rawA), parseHeaderMap(rawB), opts.allHeaders);
+
+  // Body comparison is decided on bytes, then described in text. Decoding first
+  // would turn every invalid byte into U+FFFD and report two different binary
+  // bodies as identical.
+  const bodyBytesA = splitBodyBytes(bytesA);
+  const bodyBytesB = splitBodyBytes(bytesB);
+  const byteIdentical = bodyBytesA.equals(bodyBytesB);
+  const capped = bodyBytesA.length > opts.maxBytes || bodyBytesB.length > opts.maxBytes;
+
+  output.body = diffLines(
+    bodyBytesA.subarray(0, opts.maxBytes).toString("utf-8"),
+    bodyBytesB.subarray(0, opts.maxBytes).toString("utf-8"),
+    opts.maxDiffLines,
+    opts.maxLineChars,
+  );
+  output.body.bytesA = bodyBytesA.length;
+  output.body.bytesB = bodyBytesB.length;
+  if (capped) output.body.comparedBytes = opts.maxBytes;
+  if (output.body.identical && !byteIdentical && !capped) {
+    // Same text, different bytes: the difference is outside what UTF-8 decoding preserves.
+    output.body.identical = false;
+    output.body.binaryOnlyDifference = true;
+  }
+
+  printJson(compactUndefined(output));
+}
+
+/**
+ * Write one request's evidence as files a report can reference: the raw bytes
+ * of both sides, a runnable curl, and a manifest.
+ */
+async function cmdEvidence(requestIdArg, opts) {
+  const client = await getClient();
+  let requestId = requestIdArg;
+  let findingId;
+
+  if (opts.finding) {
+    const finding = (await client.graphql(FINDING_QUERY, { id: opts.finding })).finding;
+    if (!finding) die(`Finding ${opts.finding} not found`);
+    if (!finding.request?.id) die(`Finding ${opts.finding} has no linked request`);
+    findingId = finding.id;
+    requestId = finding.request.id;
+  }
+  if (!requestId) die("Error: request-id or --finding <id> required");
+
+  const request = await getRequest(client, requestId, true, true);
+  if (!request) die(`Request ${requestId} not found`);
+
+  const dir = resolve(opts.out);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+
+  // Everything this bundle will contain, built before anything is written: a
+  // conflict on the third file must not leave the first two on disk.
+  const planned = [];
+  const requestBytes = rawToBuffer(request.raw);
+  if (requestBytes.length) planned.push({ name: "request.http", data: requestBytes });
+  const responseBytes = rawToBuffer(request.response?.raw);
+  if (responseBytes.length) planned.push({ name: "response.http", data: responseBytes });
+  const rawText = decodeRaw(request.raw);
+  if (rawText) {
+    planned.push({
+      name: "curl.sh",
+      data: Buffer.from(`#!/bin/sh\n${rawToCurl(rawText, request.host, request.port, request.isTls)}\n`, "utf-8"),
+    });
+  }
+
+  const meta = compactUndefined({
+    requestId: request.id,
+    findingId,
+    method: request.method,
+    host: request.host,
+    port: request.port,
+    isTls: request.isTls,
+    path: request.path,
+    query: request.query || undefined,
+    createdAt: request.createdAt,
+    statusCode: request.response?.statusCode,
+    responseLength: request.response?.length,
+    roundtrip: request.response?.roundtripTime,
+    files: [...planned.map((file) => file.name), "meta.json"],
+    // request.http and response.http are the bytes Caido stored; curl.sh is a
+    // reconstruction and is not byte-exact for bodies.
+    authoritative: ["request.http", "response.http"],
+  });
+  planned.push({ name: "meta.json", data: Buffer.from(`${JSON.stringify(meta, null, 2)}\n`, "utf-8") });
+
+  for (const file of planned) assertWritableTarget(join(dir, file.name), opts.force);
+
+  const files = planned.map((file) => ({
+    name: file.name,
+    // 0600: these carry session cookies and authorization headers, and the
+    // caller may have pointed --out at a directory others can read.
+    path: writeBinaryFile(join(dir, file.name), file.data, opts.force, 0o600),
+    bytes: file.data.length,
+  }));
+
+  printJson(compactUndefined({ requestId: request.id, findingId, outputDir: dir, files }));
 }
 
 async function cmdGetSession(sessionIdOrName, opts) {
@@ -1628,17 +2214,19 @@ Usage:
   caido-client.mjs <command> [options]
 
 HTTP history:
-  search <filter> [--limit n] [--after cursor] [--ids-only] [--desc|--latest]
+  search <filter> [--limit n] [--after cursor] [--ids-only] [--desc|--latest] [--scope id-or-name]
   recent [--limit n]
   get <request-id> [output options]
   get-response <request-id> [output options]
   download <request-id> --out file [--response|--request] [--body-only|--raw] [--force]
   export-curl <request-id>
+  compare <id-a> <id-b> [--request|--response] [--all-headers] [--max-diff-lines n] [--max-bytes n]
+  evidence <request-id> --out dir [--finding id] [--force]
 
 Replay:
   replay <request-id> [--raw str|@file|-] [--collection id] [connection options] [output options]
   send-raw --host host --raw str|@file|- [--port n] [--tls|--no-tls] [--name name] [--collection id] [connection options] [output options]
-  edit <request-id> [--method M] [--path p] [--set-header "N: V"] [--remove-header N] [--body b] [--replace from:::to] [--session id] [--collection id] [connection options] [output options]
+  edit <request-id> [--method M] [--path p] [--set-header "N: V"] [--remove-header N] [--body b] [--replace from:::to] [--session id] [--collection id] [--values 1-100|a,b,c|@file] [connection options] [output options]
   get-session <id-or-name> [output options]
   replay-entries <id-or-name> [--limit n] [--raw] [output options]
   edit-session <id-or-name> [edit options] [connection options] [output options]
@@ -1669,6 +2257,15 @@ Output options:
 Connection options:
   --sni <host> --connect-host <host> --connect-port <port> --connect-tls --connect-no-tls
 
+Global options:
+  --json-compact          one-line JSON instead of indented (also CAIDO_COMPACT_JSON=1)
+  --delay <ms>            minimum gap between sends to one host (also CAIDO_MIN_INTERVAL_MS)
+                          batch --values paces at ${DEFAULT_BATCH_DELAY_MS}ms unless set
+
+Batch sends:
+  edit ... --values 1-100 with {} in --path/--body/--method/--set-header/--replace.
+  One row per value; stops on the first 429/503 or send error.
+
 Auth:
   setup <pat> [url] [--no-save-pat]
   env: CAIDO_PAT, CAIDO_ACCESS_TOKEN, CAIDO_URL
@@ -1690,13 +2287,15 @@ async function main() {
       let after;
       let idsOnly = false;
       let desc = false;
+      let scope;
       for (let i = 2; i < args.length; i++) {
         if (args[i] === "--limit" && args[i + 1]) { limit = parseInt(args[i + 1], 10); i++; }
         else if (args[i] === "--after" && args[i + 1]) { after = args[i + 1]; i++; }
         else if (args[i] === "--ids-only") idsOnly = true;
         else if (args[i] === "--desc" || args[i] === "--latest") desc = true;
+        else if (args[i] === "--scope") { scope = requireFlagValue(args, i, "--scope"); i++; }
       }
-      await cmdSearch(filter, limit, after, idsOnly, desc);
+      await cmdSearch(filter, limit, after, idsOnly, desc, scope);
       break;
     }
     case "recent": {
@@ -1760,6 +2359,7 @@ async function main() {
       let path;
       let body;
       let sessionId;
+      let valueSpec;
       const setHeaders = [];
       const removeHeaders = [];
       const replacements = [];
@@ -1771,8 +2371,59 @@ async function main() {
         else if (args[i] === "--remove-header" && args[i + 1]) { removeHeaders.push(args[i + 1]); i++; }
         else if (args[i] === "--replace" && args[i + 1]) { replacements.push(args[i + 1]); i++; }
         else if (args[i] === "--session" && args[i + 1]) { sessionId = args[i + 1]; i++; }
+        else if (args[i] === "--values") { valueSpec = requireFlagValue(args, i, "--values"); i++; }
       }
-      await cmdEdit(args[1], { method, path, body, setHeaders, removeHeaders, replacements, sessionId }, parseOutputOpts(args, 2), parseConnectionOverrides(args, 2), parseCollectionId(args, 2));
+      const edits = { method, path, body, setHeaders, removeHeaders, replacements, sessionId };
+      if (valueSpec !== undefined) {
+        await cmdEditBatch(
+          args[1],
+          edits,
+          parseValueSpec(valueSpec),
+          parseOutputOpts(args, 2),
+          parseConnectionOverrides(args, 2),
+          parseCollectionId(args, 2),
+          MIN_INTERVAL_MS ?? DEFAULT_BATCH_DELAY_MS,
+        );
+      } else {
+        await cmdEdit(args[1], edits, parseOutputOpts(args, 2), parseConnectionOverrides(args, 2), parseCollectionId(args, 2));
+      }
+      break;
+    }
+    case "compare": {
+      if (!args[1] || !args[2]) die("Error: two request ids required");
+      const opts = { source: "response", allHeaders: false, maxDiffLines: 20, maxLineChars: 300, maxBytes: 262144 };
+      for (let i = 3; i < args.length; i++) {
+        if (args[i] === "--request") opts.source = "request";
+        else if (args[i] === "--response") opts.source = "response";
+        else if (args[i] === "--all-headers") opts.allHeaders = true;
+        else if (args[i] === "--max-diff-lines") {
+          opts.maxDiffLines = parseInt(requireFlagValue(args, i, "--max-diff-lines"), 10);
+          if (!Number.isFinite(opts.maxDiffLines) || opts.maxDiffLines < 0) die("Error: --max-diff-lines must be a non-negative integer");
+          i++;
+        } else if (args[i] === "--max-line-chars") {
+          opts.maxLineChars = parseInt(requireFlagValue(args, i, "--max-line-chars"), 10);
+          if (!Number.isFinite(opts.maxLineChars) || opts.maxLineChars <= 0) die("Error: --max-line-chars must be a positive integer");
+          i++;
+        } else if (args[i] === "--max-bytes") {
+          opts.maxBytes = parseInt(requireFlagValue(args, i, "--max-bytes"), 10);
+          if (!Number.isFinite(opts.maxBytes) || opts.maxBytes <= 0) die("Error: --max-bytes must be a positive integer");
+          i++;
+        }
+      }
+      await cmdCompare(args[1], args[2], opts);
+      break;
+    }
+    case "evidence": {
+      const opts = { force: false };
+      const positional = [];
+      for (let i = 1; i < args.length; i++) {
+        if (args[i] === "--out") { opts.out = requireFlagValue(args, i, "--out"); i++; }
+        else if (args[i] === "--finding") { opts.finding = requireFlagValue(args, i, "--finding"); i++; }
+        else if (args[i] === "--force") opts.force = true;
+        else if (!args[i].startsWith("--")) positional.push(args[i]);
+      }
+      if (!opts.out) die("Error: --out <dir> required");
+      await cmdEvidence(positional[0], opts);
       break;
     }
     case "export-curl": {
