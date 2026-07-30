@@ -1804,6 +1804,51 @@ async function cmdEvidence(requestIdArg, opts) {
   printJson(compactUndefined({ requestId: request.id, findingId, outputDir: dir, files }));
 }
 
+async function cmdStreams(limit, scope) {
+  const client = await getClient();
+  const scopeId = scope ? await resolveScopeId(client, scope) : undefined;
+  const data = await client.graphql(STREAMS_QUERY, { first: limit, scopeId });
+  const results = data.streams.edges.map((e) => compactUndefined({
+    id: e.node.id,
+    protocol: e.node.protocol,
+    host: e.node.host,
+    port: e.node.port,
+    path: e.node.path,
+    isTls: e.node.isTls,
+    direction: e.node.direction,
+    source: e.node.source,
+    createdAt: e.node.createdAt,
+    cursor: e.cursor,
+  }));
+  printJson({ results, pageInfo: data.streams.pageInfo, count: results.length });
+}
+
+async function cmdStreamMessages(streamId, limit, includeRaw, opts) {
+  const client = await getClient();
+  const data = await client.graphql(STREAM_MESSAGES_QUERY, { streamId, first: limit, includeRaw });
+  const results = data.streamWsMessages.edges.map((e) => {
+    const head = e.node.head || {};
+    const row = compactUndefined({
+      id: e.node.id,
+      direction: head.direction,
+      format: head.format,
+      length: head.length,
+      createdAt: head.createdAt,
+      ...alterationFields(head),
+      cursor: e.cursor,
+    });
+    if (includeRaw && head.raw) {
+      const bytes = rawToBuffer(head.raw);
+      // Binary frames are not text; say so rather than printing mojibake.
+      row.raw = head.format === "BINARY"
+        ? `[${bytes.length} binary bytes]`
+        : truncateBody(bytes.toString("utf-8"), opts.maxBodyLines, opts.maxBodyChars);
+    }
+    return row;
+  });
+  printJson({ streamId, results, pageInfo: data.streamWsMessages.pageInfo, count: results.length });
+}
+
 /**
  * Caido's own deduplicated view of what has been seen on a host, which is the
  * coverage question ("which paths do I know here") answered without paging
@@ -2386,6 +2431,8 @@ Sessions and collections:
 
 Other:
   sitemap [host] [--scope s] [--all] [--limit n]   what has been seen on a host
+  streams [--limit n] [--scope s]                 WebSocket and SSE streams
+  stream-messages <stream-id> [--limit n] [--raw] [output options]
   rules                   list match-and-replace rules rewriting traffic
   findings | get-finding | create-finding | update-finding
   scopes | create-scope | update-scope | delete-scope
@@ -2803,6 +2850,29 @@ async function main() {
     case "cancel-task": {
       if (!args[1]) die("Error: task id required");
       await cmdCancelTask(args[1]);
+      break;
+    }
+    case "streams": {
+      let limit = 20;
+      let scope;
+      for (let i = 1; i < args.length; i++) {
+        if (args[i] === "--limit") { limit = parseInt(requireFlagValue(args, i, "--limit"), 10); i++; }
+        else if (args[i] === "--scope") { scope = requireFlagValue(args, i, "--scope"); i++; }
+      }
+      if (!Number.isFinite(limit) || limit <= 0) die("Error: --limit must be a positive integer");
+      await cmdStreams(limit, scope);
+      break;
+    }
+    case "stream-messages": {
+      if (!args[1]) die("Error: stream id required");
+      let limit = 50;
+      let includeRaw = false;
+      for (let i = 2; i < args.length; i++) {
+        if (args[i] === "--limit") { limit = parseInt(requireFlagValue(args, i, "--limit"), 10); i++; }
+        else if (args[i] === "--raw") includeRaw = true;
+      }
+      if (!Number.isFinite(limit) || limit <= 0) die("Error: --limit must be a positive integer");
+      await cmdStreamMessages(args[1], limit, includeRaw, parseOutputOpts(args, 2));
       break;
     }
     case "sitemap": {
@@ -3390,6 +3460,41 @@ const START_AUTOMATE_TASK = `
 mutation($automateSessionId: ID!) {
   startAutomateTask(automateSessionId: $automateSessionId) {
     automateTask { id paused }
+  }
+}`;
+
+// WebSocket and SSE traffic lives outside the request tables entirely, so
+// search and recent are blind to it: a stream is not a request.
+const STREAMS_QUERY = `
+query Streams($first: Int, $after: String, $scopeId: ID) {
+  streams(first: $first, after: $after, scopeId: $scopeId) {
+    edges {
+      cursor
+      node { id host port path isTls direction source protocol createdAt }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}`;
+
+const STREAM_MESSAGES_QUERY = `
+query StreamWsMessages($streamId: ID, $first: Int, $after: String, $includeRaw: Boolean!) {
+  streamWsMessages(streamId: $streamId, first: $first, after: $after) {
+    edges {
+      cursor
+      node {
+        id
+        head {
+          id
+          direction
+          format
+          length
+          createdAt
+          alteration
+          raw @include(if: $includeRaw)
+        }
+      }
+    }
+    pageInfo { hasNextPage endCursor }
   }
 }`;
 
