@@ -96,6 +96,44 @@ node caido-client.mjs edit <request-id> --path /api/test --set-header "X-Test: 1
 node caido-client.mjs send-raw --host example.com --raw "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
 ```
 
+Compare two requests or responses instead of reading both:
+
+```bash
+node caido-client.mjs compare <id-a> <id-b>
+node caido-client.mjs compare <id-a> <id-b> --request --all-headers
+```
+
+Reports status, length delta, header differences (per-response headers such as `date` and
+`cf-ray` are listed as `ignored` unless `--all-headers`), and the differing body region.
+Equality is decided on bytes and described in text, so two binary bodies are not called
+identical because both decoded to `U+FFFD`. A minified body is one very long line, so the
+output windows around the first differing character and reports `firstDiffOffset` rather than
+printing the head.
+
+Export one request as report evidence:
+
+```bash
+node caido-client.mjs evidence <request-id> --out ./evidence
+node caido-client.mjs evidence --finding <finding-id> --out ./evidence
+```
+
+Writes `request.http`, `response.http`, `curl.sh` and `meta.json`, mode `0600` since they
+carry cookies and authorization headers. The whole set is checked before anything is written,
+so a conflict never leaves half a bundle, and a symlink target is refused even with `--force`.
+`request.http` and `response.http` are the stored bytes; `curl.sh` is a reconstruction.
+
+Send one request per value:
+
+```bash
+node caido-client.mjs edit <request-id> --path '/api/user/{}' --values 1-100
+node caido-client.mjs edit <request-id> --replace 'ORIG:::{}' --values @ids.txt --delay 500
+```
+
+`{}` marks where each value goes, in any of `--method`, `--path`, `--body`, `--set-header` or
+`--replace`. One replay session, one summary row per value instead of full bodies. `--values`
+takes an ascending range, a comma list or `@file`, caps at 1000 entries, paces at 250ms unless
+`--delay` says otherwise, and stops at the first backoff signal or send error.
+
 Management commands:
 
 ```bash
@@ -113,6 +151,24 @@ Show all commands:
 ```bash
 node caido-client.mjs --help
 ```
+
+## Global Options
+
+| Flag | Description |
+|------|-------------|
+| `--json-compact` | One-line JSON instead of indented, about a quarter fewer bytes on list output. Also `CAIDO_COMPACT_JSON=1` |
+| `--delay <ms>` | Minimum gap between sends to one host, best-effort across processes via `~/.claude/config/caido-state.json`. Also `CAIDO_MIN_INTERVAL_MS`. `--delay 0` switches off the batch default |
+
+## Backoff Reporting
+
+Every send reports a `backoff` object when the response is one of `rate-limited` (429),
+`challenge` (a `cf-mitigated` header), `service-unavailable` (503) or `retry-after`. The
+reasons are kept apart rather than collapsed, because an unavailable service and a bot check
+support different conclusions about a target. Batch runs stop on any of them.
+
+Reads retry twice on transient transport failures (502/503/504, timeouts, dropped sockets).
+Mutations never retry: a resend after an ambiguous failure would put a second request on the
+target.
 
 ## Auth Environment Variables
 
@@ -134,3 +190,5 @@ Auth resolution order:
 - Do not commit `~/.claude/config/secrets.json`.
 - This repository intentionally has no npm dependencies or install scripts.
 - `download` writes raw bytes directly from Caido's stored raw data, so binary bodies are not converted through UTF-8.
+- `evidence` writes `0600` files and refuses to write through a symlink even with `--force`.
+- `~/.claude/config/caido-state.json` holds send timestamps only, never credentials.
