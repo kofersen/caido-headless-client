@@ -5,6 +5,16 @@
  * Uses Node's built-in fetch and WebSocket instead of @caido/sdk-client,
  * graphql-tag, tsx, urql, or graphql-ws. Requires modern Node with global
  * fetch and WebSocket support; this skill documents Node 24+.
+ *
+ * Schema target: Caido v0.57.x. Every embedded operation is field-checked
+ * against the canonical documents @caido/sdk-client generates from
+ * @caido/schema-proxy 0.57.0 (src/transport/latest/documents/), and the
+ * *_V056 constants against that SDK's v0.56 transport fork. The CAIDO_V057
+ * branch below sits on the same threshold the SDK uses (TransportVersion.V0_57).
+ * Auth is checked against @caido/server-auth. Intercept and Automate have no
+ * SDK coverage and are verified against a live instance instead.
+ *
+ * Last verified 2026-07-30 against sdk-client 0.5.0.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";

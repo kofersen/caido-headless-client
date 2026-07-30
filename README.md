@@ -26,6 +26,21 @@ The client uses Node's built-in global `WebSocket`, enabled by default in Node 2
 npm install ws
 ```
 
+## Compatibility
+
+- **Schema target:** Caido v0.57.x. Verified live against 0.57.0; v0.57.1 is the current release.
+- **Reference:** the canonical GraphQL documents in [`@caido/sdk-client`](https://github.com/caido/sdk-js)
+  (`src/transport/latest/documents/`, generated from `@caido/schema-proxy` 0.57.0). Every embedded
+  query, mutation and subscription is field-checked against them; the device-code auth flow is
+  checked against `@caido/server-auth`.
+- **Version fork:** replay operations branch at Caido 0.57.0 (`*_V056` vs `*_V057`), the same
+  threshold the SDK uses for its own transport fork (`TransportVersion.V0_57`).
+- **Last verified:** 2026-07-30 against sdk-client 0.5.0. No drift — every document change since
+  0.4.0 was additive (new operations only, no edits to the ones already used here).
+
+Intercept control and Automate have no SDK coverage; those operations are hand-written and verified
+against a live instance instead.
+
 ## Setup
 
 Create a PAT in Caido Dashboard -> Developer -> Personal Access Tokens, then run:
