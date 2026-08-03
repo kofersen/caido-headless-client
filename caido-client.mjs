@@ -1917,6 +1917,163 @@ async function cmdSitemap(target, opts) {
   }));
 }
 
+// CLI name -> the @oneOf key in TamperSectionInput. Header sections take
+// add/update/remove as well as raw; everything else is raw only.
+const TAMPER_SECTIONS = {
+  "request-method": { key: "requestMethod" },
+  "request-path": { key: "requestPath" },
+  "request-query": { key: "requestQuery" },
+  "request-body": { key: "requestBody" },
+  "request-first-line": { key: "requestFirstLine" },
+  "request-header": { key: "requestHeader", header: true },
+  "request-all": { key: "requestAll" },
+  "request-sni": { key: "requestSNI" },
+  "response-header": { key: "responseHeader", header: true },
+  "response-body": { key: "responseBody" },
+  "response-status-code": { key: "responseStatusCode" },
+  "response-first-line": { key: "responseFirstLine" },
+  "response-all": { key: "responseAll" },
+  "ws-upstream": { key: "streamWsMessageUpstream", stream: true },
+  "ws-downstream": { key: "streamWsMessageDownstream", stream: true },
+};
+
+const TAMPER_SOURCES = ["AUTOMATE", "IMPORT", "INTERCEPT", "PLUGIN", "REPLAY", "SAMPLE", "WORKFLOW"];
+
+/**
+ * Turns the flags into the section input Caido expects. Kept strict rather than
+ * permissive: a rule that silently rewrites something other than what was asked
+ * for is the failure this whole area exists to prevent.
+ */
+function buildTamperSection(sectionName, op, matcher, replaceTerm) {
+  const section = TAMPER_SECTIONS[sectionName];
+  if (!section) die(`Error: unknown --section "${sectionName}". One of: ${Object.keys(TAMPER_SECTIONS).join(", ")}`);
+  if (!section.header && op !== "raw") {
+    die(`Error: --op ${op} is only available on request-header and response-header; ${sectionName} takes raw`);
+  }
+
+  let operation;
+  if (op === "remove") {
+    if (!matcher?.name) die("Error: --op remove needs --match-name <header>");
+    operation = { remove: { matcher: { name: matcher.name } } };
+  } else if (op === "add" || op === "update") {
+    if (!matcher?.name) die(`Error: --op ${op} needs --match-name <header>`);
+    if (replaceTerm === undefined) die(`Error: --op ${op} needs --replace <value>`);
+    operation = { [op]: { matcher: { name: matcher.name }, replacer: { term: { term: replaceTerm } } } };
+  } else {
+    if (!matcher || matcher.name) die("Error: raw operations need --match, --match-regex or --match-full");
+    if (replaceTerm === undefined) die("Error: raw operations need --replace <value>");
+    operation = { raw: { matcher: matcher.raw, replacer: { term: { term: replaceTerm } } } };
+  }
+
+  return { input: { [section.key]: { operation } }, isStream: !!section.stream };
+}
+
+function parseTamperSources(value) {
+  const sources = value.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
+  for (const source of sources) {
+    if (!TAMPER_SOURCES.includes(source)) die(`Error: unknown source "${source}". One of: ${TAMPER_SOURCES.join(", ").toLowerCase()}`);
+  }
+  return sources;
+}
+
+function tamperRuleOutput(rule) {
+  if (!rule) return undefined;
+  return compactUndefined({
+    id: rule.id,
+    name: rule.name,
+    enabled: !!rule.enable,
+    sources: rule.sources,
+    section: humanTamperName(rule.section?.__typename, "TamperSection"),
+    condition: rule.condition?.code || undefined,
+    collection: rule.collection ? { id: rule.collection.id, name: rule.collection.name } : undefined,
+  });
+}
+
+async function cmdCreateRule(name, opts) {
+  const client = await getClient();
+  const { input: section, isStream } = buildTamperSection(opts.section, opts.op, opts.matcher, opts.replace);
+  const collectionId = opts.collection || (await firstTamperCollectionId(client));
+  const input = compactUndefined({
+    collectionId,
+    name,
+    section,
+    sources: opts.sources,
+    condition: opts.condition ? (isStream ? { streamQL: { code: opts.condition } } : { HTTPQL: { code: opts.condition } }) : undefined,
+  });
+  const data = await client.graphql(CREATE_TAMPER_RULE, { input });
+  const rule = requirePayload(data.createTamperRule, "rule", "createTamperRule");
+  printJson({
+    created: tamperRuleOutput(rule),
+    note: "New rules start disabled. Enable with: toggle-rule <id> --on",
+  });
+}
+
+async function firstTamperCollectionId(client) {
+  const collections = (await client.graphql(TAMPER_RULES_QUERY, {})).tamperRuleCollections || [];
+  if (!collections.length) die("Error: no rule collection exists. Create one: create-rule-collection <name>");
+  return collections[0].id;
+}
+
+async function cmdUpdateRule(id, opts) {
+  const client = await getClient();
+  const existing = (await client.graphql(TAMPER_RULE_QUERY, { id })).tamperRule;
+  if (!existing) die(`Rule ${id} not found`);
+  const { input: section, isStream } = buildTamperSection(opts.section, opts.op, opts.matcher, opts.replace);
+  // Name and sources are required by the schema, so anything not passed keeps
+  // its current value rather than being silently reset.
+  const condition = opts.condition ?? existing.condition?.code;
+  const input = compactUndefined({
+    name: opts.name ?? existing.name,
+    section,
+    sources: opts.sources ?? existing.sources,
+    condition: condition ? (isStream ? { streamQL: { code: condition } } : { HTTPQL: { code: condition } }) : undefined,
+  });
+  const data = await client.graphql(UPDATE_TAMPER_RULE, { id, input });
+  printJson({ updated: tamperRuleOutput(requirePayload(data.updateTamperRule, "rule", "updateTamperRule")) });
+}
+
+async function cmdToggleRule(id, enabled) {
+  const data = await (await getClient()).graphql(TOGGLE_TAMPER_RULE, { id, enabled });
+  printJson({ toggled: tamperRuleOutput(requirePayload(data.toggleTamperRule, "rule", "toggleTamperRule")) });
+}
+
+async function cmdRenameRule(id, name) {
+  const data = await (await getClient()).graphql(RENAME_TAMPER_RULE, { id, name });
+  printJson({ renamed: tamperRuleOutput(data.renameTamperRule?.rule) });
+}
+
+async function cmdMoveRule(id, collectionId) {
+  const data = await (await getClient()).graphql(MOVE_TAMPER_RULE, { id, collectionId });
+  printJson({ moved: tamperRuleOutput(data.moveTamperRule?.rule) });
+}
+
+async function cmdDeleteRule(id) {
+  const client = await getClient();
+  const existing = (await client.graphql(TAMPER_RULE_QUERY, { id })).tamperRule;
+  if (!existing) die(`Rule ${id} not found`);
+  const data = await client.graphql(DELETE_TAMPER_RULE, { id });
+  // Echo what was removed: a deleted rewrite is as much a change to traffic as
+  // an added one, and nothing else will remember it.
+  printJson({ deleted: data.deleteTamperRule?.deletedId || id, was: tamperRuleOutput(existing) });
+}
+
+async function cmdCreateRuleCollection(name) {
+  const data = await (await getClient()).graphql(CREATE_TAMPER_COLLECTION, { input: { name } });
+  const collection = requirePayload(data.createTamperRuleCollection, "collection", "createTamperRuleCollection");
+  printJson({ id: collection.id, name: collection.name });
+}
+
+async function cmdRenameRuleCollection(id, name) {
+  const data = await (await getClient()).graphql(RENAME_TAMPER_COLLECTION, { id, name });
+  const collection = requirePayload(data.renameTamperRuleCollection, "collection", "renameTamperRuleCollection");
+  printJson({ id: collection.id, name: collection.name, renamed: true });
+}
+
+async function cmdDeleteRuleCollection(id) {
+  const data = await (await getClient()).graphql(DELETE_TAMPER_COLLECTION, { id });
+  printJson({ deleted: data.deleteTamperRuleCollection?.deletedId || id });
+}
+
 function humanTamperName(typename, prefix) {
   return String(typename || "")
     .replace(prefix, "")
@@ -1963,6 +2120,7 @@ async function cmdRules() {
         id: rule.id,
         name: rule.name,
         enabled: isEnabled,
+        sources: rule.sources,
         section: humanTamperName(rule.section?.__typename, "TamperSection"),
         condition: rule.condition?.code || undefined,
         operation: operation ? humanTamperName(operation.__typename, /^TamperOperation(Header|Body)/) : undefined,
@@ -2439,6 +2597,14 @@ Other:
   streams [--limit n] [--scope s] [--filter streamql]
   stream-messages <stream-id> [--limit n] [--raw] [--filter streamql] [output options]
   rules                   list match-and-replace rules rewriting traffic
+  create-rule <name> --section <s> [--op raw|add|update|remove]
+              [--match v | --match-regex re | --match-full | --match-name h]
+              [--replace v] [--condition q] [--sources a,b] [--collection id]
+  update-rule <id> ... (same flags; unset fields keep their value)
+  toggle-rule <id> --on|--off | rename-rule <id> <name> | move-rule <id> <coll>
+  delete-rule <id>
+  create-rule-collection <name> | rename-rule-collection <id> <name>
+  delete-rule-collection <id>
   findings | get-finding | create-finding | update-finding
   scopes | create-scope | update-scope | delete-scope
   filters | create-filter | update-filter | delete-filter
@@ -2897,6 +3063,76 @@ async function main() {
         else if (!args[i].startsWith("--") && target === undefined) target = args[i];
       }
       await cmdSitemap(target, opts);
+      break;
+    }
+    case "create-rule":
+    case "update-rule": {
+      const isCreate = command === "create-rule";
+      if (!args[1]) die(isCreate ? "Error: rule name required" : "Error: rule id required");
+      const opts = { op: "raw", sources: undefined, matcher: undefined };
+      for (let i = 2; i < args.length; i++) {
+        if (args[i] === "--section") { opts.section = requireFlagValue(args, i, "--section"); i++; }
+        else if (args[i] === "--op") { opts.op = requireFlagValue(args, i, "--op"); i++; }
+        else if (args[i] === "--match") { opts.matcher = { raw: { value: { value: requireFlagValue(args, i, "--match") } } }; i++; }
+        else if (args[i] === "--match-regex") { opts.matcher = { raw: { regex: { regex: requireFlagValue(args, i, "--match-regex") } } }; i++; }
+        else if (args[i] === "--match-name") { opts.matcher = { name: requireFlagValue(args, i, "--match-name") }; i++; }
+        else if (args[i] === "--match-full") opts.matcher = { raw: { full: { full: true } } };
+        else if (args[i] === "--replace") { opts.replace = requireFlagValue(args, i, "--replace"); i++; }
+        else if (args[i] === "--condition") { opts.condition = requireFlagValue(args, i, "--condition"); i++; }
+        else if (args[i] === "--sources") { opts.sources = parseTamperSources(requireFlagValue(args, i, "--sources")); i++; }
+        else if (args[i] === "--collection") { opts.collection = requireFlagValue(args, i, "--collection"); i++; }
+        else if (args[i] === "--name") { opts.name = requireFlagValue(args, i, "--name"); i++; }
+      }
+      if (!opts.section) die(`Error: --section required. One of: ${Object.keys(TAMPER_SECTIONS).join(", ")}`);
+      if (isCreate) {
+        // Both the browser's traffic and this client's own sends, which is what
+        // a program-required header has to cover. Narrow it with --sources.
+        opts.sources = opts.sources ?? ["INTERCEPT", "REPLAY"];
+        await cmdCreateRule(args[1], opts);
+      } else {
+        await cmdUpdateRule(args[1], opts);
+      }
+      break;
+    }
+    case "toggle-rule": {
+      if (!args[1]) die("Error: rule id required");
+      let enabled;
+      for (let i = 2; i < args.length; i++) {
+        if (args[i] === "--on") enabled = true;
+        else if (args[i] === "--off") enabled = false;
+      }
+      if (enabled === undefined) die("Error: --on or --off required");
+      await cmdToggleRule(args[1], enabled);
+      break;
+    }
+    case "rename-rule": {
+      if (!args[1] || !args[2]) die("Error: rule id and new name required");
+      await cmdRenameRule(args[1], args[2]);
+      break;
+    }
+    case "move-rule": {
+      if (!args[1] || !args[2]) die("Error: rule id and collection id required");
+      await cmdMoveRule(args[1], args[2]);
+      break;
+    }
+    case "delete-rule": {
+      if (!args[1]) die("Error: rule id required");
+      await cmdDeleteRule(args[1]);
+      break;
+    }
+    case "create-rule-collection": {
+      if (!args[1]) die("Error: collection name required");
+      await cmdCreateRuleCollection(args[1]);
+      break;
+    }
+    case "rename-rule-collection": {
+      if (!args[1] || !args[2]) die("Error: collection id and new name required");
+      await cmdRenameRuleCollection(args[1], args[2]);
+      break;
+    }
+    case "delete-rule-collection": {
+      if (!args[1]) die("Error: collection id required");
+      await cmdDeleteRuleCollection(args[1]);
       break;
     }
     case "rules": await cmdRules(); break;
@@ -3567,6 +3803,7 @@ query TamperRules {
     rules {
       id
       name
+      sources
       enable { rank }
       condition {
         __typename
@@ -3582,6 +3819,81 @@ query TamperRules {
       }
     }
   }
+}`;
+
+const TAMPER_RULE_RESULT = `
+    id
+    name
+    sources
+    enable { rank }
+    condition { __typename ... on HTTPQL { code } ... on StreamQL { code } }
+    section { __typename }
+    collection { id name }`;
+
+const CREATE_TAMPER_RULE = `
+mutation CreateTamperRule($input: CreateTamperRuleInput!) {
+  createTamperRule(input: $input) {
+    error { __typename }
+    rule {${TAMPER_RULE_RESULT}
+    }
+  }
+}`;
+
+const UPDATE_TAMPER_RULE = `
+mutation UpdateTamperRule($id: ID!, $input: UpdateTamperRuleInput!) {
+  updateTamperRule(id: $id, input: $input) {
+    error { __typename }
+    rule {${TAMPER_RULE_RESULT}
+    }
+  }
+}`;
+
+const RENAME_TAMPER_RULE = `
+mutation RenameTamperRule($id: ID!, $name: String!) {
+  renameTamperRule(id: $id, name: $name) {
+    rule {${TAMPER_RULE_RESULT}
+    }
+  }
+}`;
+
+const TOGGLE_TAMPER_RULE = `
+mutation ToggleTamperRule($id: ID!, $enabled: Boolean!) {
+  toggleTamperRule(id: $id, enabled: $enabled) {
+    error { __typename }
+    rule {${TAMPER_RULE_RESULT}
+    }
+  }
+}`;
+
+const MOVE_TAMPER_RULE = `
+mutation MoveTamperRule($id: ID!, $collectionId: ID!) {
+  moveTamperRule(id: $id, collectionId: $collectionId) {
+    rule {${TAMPER_RULE_RESULT}
+    }
+  }
+}`;
+
+const DELETE_TAMPER_RULE = `mutation DeleteTamperRule($id: ID!) { deleteTamperRule(id: $id) { deletedId } }`;
+
+const TAMPER_RULE_QUERY = `
+query TamperRule($id: ID!) {
+  tamperRule(id: $id) {${TAMPER_RULE_RESULT}
+  }
+}`;
+
+const CREATE_TAMPER_COLLECTION = `
+mutation CreateTamperRuleCollection($input: CreateTamperRuleCollectionInput!) {
+  createTamperRuleCollection(input: $input) { collection { id name } }
+}`;
+
+const RENAME_TAMPER_COLLECTION = `
+mutation RenameTamperRuleCollection($id: ID!, $name: String!) {
+  renameTamperRuleCollection(id: $id, name: $name) { collection { id name } }
+}`;
+
+const DELETE_TAMPER_COLLECTION = `
+mutation DeleteTamperRuleCollection($id: ID!) {
+  deleteTamperRuleCollection(id: $id) { deletedId }
 }`;
 
 const AUTH_START = `
