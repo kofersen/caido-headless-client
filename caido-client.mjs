@@ -2529,7 +2529,10 @@ async function cmdAuthStatus() {
     const client = await getClient();
     const viewer = (await client.graphql(VIEWER_QUERY)).viewer;
     const health = await client.health();
-    printJson({
+    // History, findings, sitemap, streams and rules are all project data, so
+    // "which project is selected" decides what every other command can see.
+    const project = (await client.graphql(CURRENT_PROJECT_QUERY)).currentProject?.project;
+    printJson(compactUndefined({
       authenticated: true,
       authMode,
       hasPat,
@@ -2538,9 +2541,10 @@ async function cmdAuthStatus() {
       cachedTokenExpiresAt: cachedExpiresAt,
       cachedTokenValid,
       url: client.url,
+      project: project ? { id: project.id, name: project.name } : undefined,
       user: viewer,
       health,
-    });
+    }));
   } catch (err) {
     printJson({
       authenticated: false,
@@ -3617,6 +3621,11 @@ fragment ProjectFull on Project {
 
 const PROJECTS_QUERY = `${PROJECT_FRAGMENT} query Projects { projects { ...ProjectFull } }`;
 const SELECT_PROJECT = `${PROJECT_FRAGMENT} mutation SelectProject($id: ID!) { selectProject(id: $id) { currentProject { project { ...ProjectFull } } error { __typename } } }`;
+
+const CURRENT_PROJECT_QUERY = `
+query CurrentProject {
+  currentProject { project { id name } }
+}`;
 
 const HOSTED_FILES_QUERY = `
 query HostedFiles {
