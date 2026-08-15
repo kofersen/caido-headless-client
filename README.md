@@ -68,6 +68,8 @@ The embedded GraphQL is field-checked against the canonical documents in [`caido
 | Scope | `search --scope` filters history by a Caido scope | not exposed |
 | Coverage | `sitemap` gives Caido's deduplicated tree of what has been seen on a host | not exposed |
 | WebSocket | `streams` and `stream-messages` read WS and SSE traffic with StreamQL filtering, which `search` cannot see; `ws-connect` / `ws-send` / `ws-stop` open a WS replay session and push frames into it | not exposed |
+| DNS | `dns-rewrites` and `dns-upstreams` read and write resolution, so a name can be pointed at an internal address with the Host header, SNI and certificate left intact — for browser traffic as well as this client's | not exposed |
+| Projects | `create-project`, `rename-project`, `persist-project`, `delete-project` alongside list and select | list and select only |
 | Hosted files | `upload-hosted-file` serves a payload from the instance; list and delete alongside it | not exposed |
 | Proxy rewrites | full match-and-replace management; `get`, `search` and sends report `alteration` and `edited` | equivalent M&R management as of v3.2.0, plus `test-mr-rule` for previewing one; `alteration`/`edited` are not exposed, so a rule's effect reads as the target's behaviour |
 | Expired access token | refresh token is stored, rotated on the first auth failure, and the call retried | refresh token is never stored; the run exits telling you to re-run `setup <pat>` |
@@ -108,12 +110,10 @@ Checked against the live 0.57.1 schema on 2026-08-15.
 | Certificate **export** | Not in the API. The schema has `importCertificate` and `regenerateCertificate` and no export of any kind, and no REST route serves the CA either. Nothing to wrap, whatever the SDK's surface list implies |
 | Certificate import / regenerate | Would replace or reissue the CA for the whole instance. A wrong call breaks every proxied client at once, and the UI is the safer place for a once-a-year action |
 | Workflows — list, create, update, toggle, test, run | An agent driving this client can express the same logic in the shell it is already in, and read the result directly instead of through a workflow's output |
-| DNS upstream resolvers and rewrites | `--connect-host`, `--connect-port` and `--sni` already redirect this client's own sends without touching the header. A rewrite only adds anything for *browser* traffic, which is a real but narrower case |
 | Hosted-file **rename** | `upload-hosted-file` and `delete-hosted-file` cover the lifecycle; a rename is a re-upload |
 | Plugin installation | Installs code into the operator's instance. Not an agent's call to make |
 | `createRequest` | Puts a request into history without sending it. Everything here is interested in what a target answered |
 | `deleteFindings` | Destructive, and findings are the record of the engagement |
-| Project create / rename / delete | Delete is destructive; create is genuinely useful given one-project-per-engagement, and is the most likely next addition |
 | Instance settings | They carry AI provider API keys. Deliberately out of scope |
 
 ## Setup

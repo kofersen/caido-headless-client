@@ -171,6 +171,11 @@ function parseConnectionOverrides(args, startIdx) {
   return overrides;
 }
 
+/** `--allow "a,b, c"` is one argument holding a list; three places parse it. */
+function splitList(value) {
+  return value.split(",").map((v) => v.trim()).filter(Boolean);
+}
+
 function parseCollectionId(args, startIdx) {
   for (let i = startIdx; i < args.length; i++) {
     if (args[i] === "--collection" && args[i + 1]) return args[i + 1];
@@ -2519,6 +2524,142 @@ async function cmdHostedFiles() {
   printJson((await (await getClient()).graphql(HOSTED_FILES_QUERY)).hostedFiles);
 }
 
+/**
+ * A DNS rewrite resolves a hostname to somewhere of your choosing before the
+ * request leaves, so the Host header, SNI and certificate all stay honest. That
+ * is the difference from --connect-host, which only redirects this client's own
+ * sends: a rewrite also moves the browser's traffic.
+ */
+async function cmdDnsRewrites() {
+  printJson((await (await getClient()).graphql(DNS_REWRITES_QUERY)).dnsRewrites);
+}
+
+async function cmdDnsUpstreams() {
+  printJson((await (await getClient()).graphql(DNS_UPSTREAMS_QUERY)).dnsUpstreams);
+}
+
+/** Accepts an upstream resolver's id or its name. */
+async function resolveUpstreamId(client, idOrName) {
+  const list = (await client.graphql(DNS_UPSTREAMS_QUERY)).dnsUpstreams || [];
+  const match = list.find((u) => u.id === idOrName) || list.find((u) => u.name === idOrName);
+  if (!match) die(`DNS upstream "${idOrName}" not found. Run: caido-client.mjs dns-upstreams`);
+  return match.id;
+}
+
+async function buildDnsResolution(client, ip, upstream) {
+  if (ip && upstream) die("Error: --ip and --upstream are alternatives, not both");
+  if (ip) return { ip: { ip } };
+  if (upstream) return { upstream: { id: await resolveUpstreamId(client, upstream) } };
+  return undefined;
+}
+
+async function cmdCreateDnsRewrite(allow, deny, ip, upstream) {
+  const client = await getClient();
+  const resolution = await buildDnsResolution(client, ip, upstream);
+  if (!resolution) die("Error: one of --ip <address> or --upstream <id-or-name> is required");
+  if (!allow?.length) die("Error: --allow <host,host> is required; a rewrite with no allowlist matches nothing");
+  const data = await client.graphql(CREATE_DNS_REWRITE, {
+    input: { resolution, allowlist: allow, denylist: deny || [] },
+  });
+  printJson(requirePayload(data.createDnsRewrite, "rewrite", "createDnsRewrite"));
+}
+
+/**
+ * Every field of the update input is required, so a partial edit has to read the
+ * rewrite first. Sending only --ip would otherwise clear the allowlist and leave
+ * a rewrite that matches nothing.
+ */
+async function cmdUpdateDnsRewrite(rewriteId, allow, deny, ip, upstream) {
+  const client = await getClient();
+  const existing = ((await client.graphql(DNS_REWRITES_QUERY)).dnsRewrites || []).find((r) => r.id === rewriteId);
+  if (!existing) die(`DNS rewrite ${rewriteId} not found. Run: caido-client.mjs dns-rewrites`);
+  const resolution = (await buildDnsResolution(client, ip, upstream)) ?? (
+    existing.resolution.__typename === "DNSIpResolver"
+      ? { ip: { ip: existing.resolution.ip } }
+      : { upstream: { id: existing.resolution.id } }
+  );
+  const data = await client.graphql(UPDATE_DNS_REWRITE, {
+    id: rewriteId,
+    input: { resolution, allowlist: allow ?? existing.allowlist, denylist: deny ?? existing.denylist },
+  });
+  printJson(requirePayload(data.updateDnsRewrite, "rewrite", "updateDnsRewrite"));
+}
+
+async function cmdToggleDnsRewrite(rewriteId, enabled) {
+  const data = await (await getClient()).graphql(TOGGLE_DNS_REWRITE, { id: rewriteId, enabled });
+  printJson(requirePayload(data.toggleDnsRewrite, "rewrite", "toggleDnsRewrite"));
+}
+
+async function cmdDeleteDnsRewrite(rewriteId) {
+  await (await getClient()).graphql(DELETE_DNS_REWRITE, { id: rewriteId });
+  printJson({ deleted: rewriteId });
+}
+
+async function cmdCreateDnsUpstream(name, ip) {
+  const data = await (await getClient()).graphql(CREATE_DNS_UPSTREAM, { input: { name, ip } });
+  printJson(requirePayload(data.createDnsUpstream, "upstream", "createDnsUpstream"));
+}
+
+async function cmdUpdateDnsUpstream(idOrName, name, ip) {
+  const client = await getClient();
+  const list = (await client.graphql(DNS_UPSTREAMS_QUERY)).dnsUpstreams || [];
+  const existing = list.find((u) => u.id === idOrName) || list.find((u) => u.name === idOrName);
+  if (!existing) die(`DNS upstream "${idOrName}" not found. Run: caido-client.mjs dns-upstreams`);
+  const data = await client.graphql(UPDATE_DNS_UPSTREAM, {
+    id: existing.id,
+    input: { name: name ?? existing.name, ip: ip ?? existing.ip },
+  });
+  printJson(requirePayload(data.updateDnsUpstream, "upstream", "updateDnsUpstream"));
+}
+
+async function cmdDeleteDnsUpstream(idOrName) {
+  const client = await getClient();
+  const id = await resolveUpstreamId(client, idOrName);
+  await client.graphql(DELETE_DNS_UPSTREAM, { id });
+  printJson({ deleted: id });
+}
+
+/** Accepts a project's id or its name. */
+async function resolveProjectId(client, idOrName) {
+  const list = (await client.graphql(PROJECTS_QUERY)).projects || [];
+  const match = list.find((p) => p.id === idOrName) || list.find((p) => p.name === idOrName);
+  if (!match) die(`Project "${idOrName}" not found. Run: caido-client.mjs projects`);
+  return match.id;
+}
+
+/**
+ * A temporary project is discarded when Caido restarts, which is right for a
+ * throwaway look and wrong for an engagement, so the flag is explicit rather
+ * than a default either way. `persist-project` promotes one afterwards.
+ */
+async function cmdCreateProject(name, temporary) {
+  const data = await (await getClient()).graphql(CREATE_PROJECT, { input: { name, temporary } });
+  printJson(requirePayload(data.createProject, "project", "createProject"));
+}
+
+async function cmdRenameProject(idOrName, name) {
+  const client = await getClient();
+  const data = await client.graphql(RENAME_PROJECT, { id: await resolveProjectId(client, idOrName), name });
+  printJson({ ...requirePayload(data.renameProject, "project", "renameProject"), renamed: true });
+}
+
+async function cmdPersistProject(idOrName) {
+  const client = await getClient();
+  const data = await client.graphql(PERSIST_PROJECT, { id: await resolveProjectId(client, idOrName) });
+  printJson({ ...requirePayload(data.persistProject, "project", "persistProject"), persisted: true });
+}
+
+async function cmdDeleteProject(idOrName) {
+  const client = await getClient();
+  const id = await resolveProjectId(client, idOrName);
+  const current = (await client.graphql(CURRENT_PROJECT_QUERY)).currentProject?.project;
+  if (current?.id === id) die(`Project ${id} is the selected one. Select another first: caido-client.mjs select-project <id>`);
+  const data = await client.graphql(DELETE_PROJECT, { id });
+  const err = firstPayloadError(data.deleteProject);
+  if (err) die(`deleteProject failed: ${err}`);
+  printJson({ deleted: data.deleteProject?.deletedId || id });
+}
+
 async function cmdUploadHostedFile(filePath, name) {
   const path = resolve(filePath);
   if (!existsSync(path)) die(`File ${path} not found`);
@@ -2753,6 +2894,15 @@ Other:
   filters | create-filter | update-filter | delete-filter
   envs | create-env | select-env | env-set | delete-env
   projects | select-project | hosted-files | upload-hosted-file <path> [--name n] | delete-hosted-file
+  create-project <name> [--temporary] | rename-project <id-or-name> <new> | persist-project <id-or-name> | delete-project <id-or-name>
+
+DNS:
+  dns-rewrites | dns-upstreams
+  create-dns-rewrite --allow host,host [--deny host,host] (--ip addr | --upstream id-or-name)
+  update-dns-rewrite <id> [--allow h,h] [--deny h,h] [--ip addr | --upstream id-or-name]
+  toggle-dns-rewrite <id> --on|--off
+  delete-dns-rewrite <id>
+  create-dns-upstream <name> --ip addr | update-dns-upstream <id-or-name> [--name n] [--ip a] | delete-dns-upstream <id-or-name>
   tasks | cancel-task | intercept-status | intercept-enable | intercept-disable
   viewer | plugins | health | setup | auth-status
 
@@ -3087,8 +3237,8 @@ async function main() {
       let allow = [];
       let denyList = [];
       for (let i = 2; i < args.length; i++) {
-        if (args[i] === "--allow" && args[i + 1]) { allow = args[i + 1].split(",").map((s) => s.trim()).filter(Boolean); i++; }
-        else if (args[i] === "--deny" && args[i + 1]) { denyList = args[i + 1].split(",").map((s) => s.trim()).filter(Boolean); i++; }
+        if (args[i] === "--allow" && args[i + 1]) { allow = splitList(args[i + 1]); i++; }
+        else if (args[i] === "--deny" && args[i + 1]) { denyList = splitList(args[i + 1]); i++; }
       }
       await cmdCreateScope(args[1], allow, denyList);
       break;
@@ -3100,8 +3250,8 @@ async function main() {
       let denyList;
       for (let i = 2; i < args.length; i++) {
         if (args[i] === "--name" && args[i + 1]) { name = args[i + 1]; i++; }
-        else if (args[i] === "--allow" && args[i + 1]) { allow = args[i + 1].split(",").map((s) => s.trim()).filter(Boolean); i++; }
-        else if (args[i] === "--deny" && args[i + 1]) { denyList = args[i + 1].split(",").map((s) => s.trim()).filter(Boolean); i++; }
+        else if (args[i] === "--allow" && args[i + 1]) { allow = splitList(args[i + 1]); i++; }
+        else if (args[i] === "--deny" && args[i + 1]) { denyList = splitList(args[i + 1]); i++; }
       }
       await cmdUpdateScope(args[1], name, allow, denyList);
       break;
@@ -3157,6 +3307,86 @@ async function main() {
     case "delete-env": {
       if (!args[1]) die("Error: environment id required");
       await cmdDeleteEnv(args[1]);
+      break;
+    }
+    case "dns-rewrites": await cmdDnsRewrites(); break;
+    case "dns-upstreams": await cmdDnsUpstreams(); break;
+    case "create-dns-rewrite": {
+      let allow, deny, ip, upstream;
+      for (let i = 1; i < args.length; i++) {
+        if (args[i] === "--allow" && args[i + 1]) { allow = splitList(args[i + 1]); i++; }
+        else if (args[i] === "--deny" && args[i + 1]) { deny = splitList(args[i + 1]); i++; }
+        else if (args[i] === "--ip" && args[i + 1]) { ip = args[i + 1]; i++; }
+        else if (args[i] === "--upstream" && args[i + 1]) { upstream = args[i + 1]; i++; }
+      }
+      await cmdCreateDnsRewrite(allow, deny, ip, upstream);
+      break;
+    }
+    case "update-dns-rewrite": {
+      if (!args[1]) die("Error: rewrite id required");
+      let allow, deny, ip, upstream;
+      for (let i = 2; i < args.length; i++) {
+        if (args[i] === "--allow" && args[i + 1]) { allow = splitList(args[i + 1]); i++; }
+        else if (args[i] === "--deny" && args[i + 1]) { deny = splitList(args[i + 1]); i++; }
+        else if (args[i] === "--ip" && args[i + 1]) { ip = args[i + 1]; i++; }
+        else if (args[i] === "--upstream" && args[i + 1]) { upstream = args[i + 1]; i++; }
+      }
+      await cmdUpdateDnsRewrite(args[1], allow, deny, ip, upstream);
+      break;
+    }
+    case "toggle-dns-rewrite": {
+      if (!args[1]) die("Error: rewrite id required");
+      const on = args.includes("--on");
+      if (on === args.includes("--off")) die("Error: one of --on or --off");
+      await cmdToggleDnsRewrite(args[1], on);
+      break;
+    }
+    case "delete-dns-rewrite": {
+      if (!args[1]) die("Error: rewrite id required");
+      await cmdDeleteDnsRewrite(args[1]);
+      break;
+    }
+    case "create-dns-upstream": {
+      if (!args[1]) die("Error: upstream name required");
+      let ip;
+      for (let i = 2; i < args.length; i++) if (args[i] === "--ip" && args[i + 1]) { ip = args[i + 1]; i++; }
+      if (!ip) die("Error: --ip <address> required");
+      await cmdCreateDnsUpstream(args[1], ip);
+      break;
+    }
+    case "update-dns-upstream": {
+      if (!args[1]) die("Error: upstream id or name required");
+      let name, ip;
+      for (let i = 2; i < args.length; i++) {
+        if (args[i] === "--name" && args[i + 1]) { name = args[i + 1]; i++; }
+        else if (args[i] === "--ip" && args[i + 1]) { ip = args[i + 1]; i++; }
+      }
+      await cmdUpdateDnsUpstream(args[1], name, ip);
+      break;
+    }
+    case "delete-dns-upstream": {
+      if (!args[1]) die("Error: upstream id or name required");
+      await cmdDeleteDnsUpstream(args[1]);
+      break;
+    }
+    case "create-project": {
+      if (!args[1]) die("Error: project name required");
+      await cmdCreateProject(args[1], args.includes("--temporary"));
+      break;
+    }
+    case "rename-project": {
+      if (!args[1] || !args[2]) die("Error: project id-or-name and new name required");
+      await cmdRenameProject(args[1], args[2]);
+      break;
+    }
+    case "persist-project": {
+      if (!args[1]) die("Error: project id or name required");
+      await cmdPersistProject(args[1]);
+      break;
+    }
+    case "delete-project": {
+      if (!args[1]) die("Error: project id or name required");
+      await cmdDeleteProject(args[1]);
       break;
     }
     case "hosted-files": await cmdHostedFiles(); break;
@@ -3835,6 +4065,66 @@ const STOP_REPLAY_WS_TASKS = `
 mutation StopReplayWsTasks($taskIds: [ID!]!) {
   stopReplayWsTasks(taskIds: $taskIds) { taskIds }
 }`;
+
+const DNS_REWRITE_FIELDS = `
+  id
+  enabled
+  allowlist
+  denylist
+  resolution {
+    __typename
+    ... on DNSIpResolver { ip }
+    ... on DNSUpstreamResolver { id }
+  }`;
+
+const DNS_REWRITES_QUERY = `query DnsRewrites { dnsRewrites { ${DNS_REWRITE_FIELDS} } }`;
+const DNS_UPSTREAMS_QUERY = `query DnsUpstreams { dnsUpstreams { id name ip } }`;
+
+const CREATE_DNS_REWRITE = `
+mutation CreateDnsRewrite($input: CreateDNSRewriteInput!) {
+  createDnsRewrite(input: $input) { rewrite { ${DNS_REWRITE_FIELDS} } error { __typename } }
+}`;
+
+const UPDATE_DNS_REWRITE = `
+mutation UpdateDnsRewrite($id: ID!, $input: UpdateDNSRewriteInput!) {
+  updateDnsRewrite(id: $id, input: $input) { rewrite { ${DNS_REWRITE_FIELDS} } error { __typename } }
+}`;
+
+const TOGGLE_DNS_REWRITE = `
+mutation ToggleDnsRewrite($id: ID!, $enabled: Boolean!) {
+  toggleDnsRewrite(id: $id, enabled: $enabled) { rewrite { ${DNS_REWRITE_FIELDS} } }
+}`;
+
+const DELETE_DNS_REWRITE = `mutation DeleteDnsRewrite($id: ID!) { deleteDnsRewrite(id: $id) { deletedId } }`;
+
+const CREATE_DNS_UPSTREAM = `
+mutation CreateDnsUpstream($input: CreateDNSUpstreamInput!) {
+  createDnsUpstream(input: $input) { upstream { id name ip } error { __typename } }
+}`;
+
+const UPDATE_DNS_UPSTREAM = `
+mutation UpdateDnsUpstream($id: ID!, $input: UpdateDNSUpstreamInput!) {
+  updateDnsUpstream(id: $id, input: $input) { upstream { id name ip } error { __typename } }
+}`;
+
+const DELETE_DNS_UPSTREAM = `mutation DeleteDnsUpstream($id: ID!) { deleteDnsUpstream(id: $id) { deletedId } }`;
+
+const CREATE_PROJECT = `
+mutation CreateProject($input: CreateProjectInput!) {
+  createProject(input: $input) { project { id name temporary status path size createdAt } error { __typename } }
+}`;
+
+const RENAME_PROJECT = `
+mutation RenameProject($id: ID!, $name: String!) {
+  renameProject(id: $id, name: $name) { project { id name temporary } error { __typename } }
+}`;
+
+const PERSIST_PROJECT = `
+mutation PersistProject($id: ID!) {
+  persistProject(id: $id) { project { id name temporary } error { __typename } }
+}`;
+
+const DELETE_PROJECT = `mutation DeleteProject($id: ID!) { deleteProject(id: $id) { deletedId error { __typename } } }`;
 
 const VIEWER_QUERY = `
 query Viewer {
