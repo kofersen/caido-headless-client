@@ -41,6 +41,74 @@ npm install ws
 Intercept control and Automate have no SDK coverage; those operations are hand-written and verified
 against a live instance instead.
 
+## Upstream parity
+
+The `caido-mode` skill that ships this client began as a mirror of Caido's official [`caido/skills`](https://github.com/caido/skills) `caido-mode` — same command names, same flags, same output field shapes, and the same `~/.claude/config/secrets.json` path and format. Upstream has since diverged.
+
+Checked 2026-08-10 against upstream **v3.2.0** (the `caido-mode-revamp` merge, PR #22). It still pins `@caido/sdk-client` ^0.4.0. Two things it has that this client does not:
+
+- **`export-curl --config`** — writes a reusable `-K` config per host holding the proxy line and every auth/identity header from a captured request, cookies inlined statically. Upstream's whole testing model is built on it: probe with `curl -K auth.cfg`, and use Replay only to hand a request to the operator. This client has `export-curl` in its self-contained form only.
+- **`test-mr-rule`** — preview a match-and-replace rule against a raw message without applying it. Deliberately skipped here (see *Checked and left out*), a decision worth revisiting now that upstream has built it.
+
+A third, `--name` on every session-creating command plus collections resolvable by name, landed here in `e96bd48` after upstream arrived at the same two changes independently.
+
+The embedded GraphQL is field-checked against the canonical documents in [`caido/sdk-js`](https://github.com/caido/sdk-js) — `@caido/sdk-client` 0.5.0, generated from `@caido/schema-proxy` 0.57.0 — with no drift, since every document change between 0.4.0 and 0.5.0 was additive. Details under **Compatibility** above.
+
+### What differs
+
+| | This client | Upstream `caido-mode` v3.2.0 |
+|---|---|---|
+| Implementation | one dependency-free `.mjs` on Node's built-in `fetch` and `WebSocket` | `@caido/sdk-client` + `graphql-tag` + `tsx`, installed from npm |
+| Auditability | exact client revision pinned by submodule commit hash | dependency range (`^0.4.0`) resolved at install time |
+| Binary bodies | `download` writes raw bytes — `--out`, `--request`/`--response`, `--raw`, `--body-only`, `--force` | no such command; bodies only come back through JSON text |
+| Comparing two results | `compare` reports status, length, header deltas and the differing body region, decided on bytes | not available; read both responses and judge |
+| Report evidence | `evidence` writes `request.http`, `response.http`, `curl.sh`, `meta.json` at `0600` | assemble by hand from `download` and `export-curl` |
+| Repeating one request | `edit --values` sends one per value in a single session, a row each, stopping on backoff | one invocation per value |
+| Rate discipline | `--delay` paces sends per host across processes; 429, challenge, 503 and `Retry-After` are reported as `backoff` | no pacing, no backoff signal |
+| Scope | `search --scope` filters history by a Caido scope | not exposed |
+| Coverage | `sitemap` gives Caido's deduplicated tree of what has been seen on a host | not exposed |
+| WebSocket | `streams` and `stream-messages` read WS and SSE traffic with StreamQL filtering, which `search` cannot see | not exposed |
+| Proxy rewrites | full match-and-replace management; `get`, `search` and sends report `alteration` and `edited` | equivalent M&R management as of v3.2.0, plus `test-mr-rule` for previewing one; `alteration`/`edited` are not exposed, so a rule's effect reads as the target's behaviour |
+| Expired access token | refresh token is stored, rotated on the first auth failure, and the call retried | refresh token is never stored; the run exits telling you to re-run `setup <pat>` |
+| PAT on disk | `setup --no-save-pat` keeps it out of `secrets.json` | `setup` always writes the PAT |
+| Auth env vars | `CAIDO_ACCESS_TOKEN`, `CAIDO_INSTANCE_URL`, `CAIDO_URL`, `CAIDO_PAT` | `CAIDO_URL`, `CAIDO_PAT` |
+| Schema versions | GraphQL forked in-client at the 0.57.0 threshold (`*_V056` / `*_V057`) | delegated to the SDK's own transport forks |
+| Older Node | optional `ws` fallback below Node 22.4 | handled by the SDK's transport |
+
+The last two rows are a trade rather than a win: tracking Caido's schema by hand is what the missing dependencies cost, which is why the verification note above carries a date.
+
+## Checked and left out
+
+Verified against the live schema on 2026-07-30, recorded so it is not re-researched:
+
+- **Bulk request export** (`startExportRequestsTask`, JSON/CSV with raw) returns
+  `PermissionDeniedUserError` on a Basic plan with no entitlements. It is a paid feature, so a
+  command for it would fail every time here.
+- **Findings export** (`exportFindings` → a signed `downloadUri`) works, but returns what
+  `findings` already gives as JSON. Redundant.
+- **Intercept queue** (`interceptMessages(kind:)` plus forward and drop) works and is empty
+  unless something is held. Left out because interception is an interactive workflow: an agent
+  forwarding or dropping traffic would act on the operator's own live session. Note that
+  `interceptEntries` is intercept *history*, which `search 'source:"intercept"'` already covers.
+- **Response screenshots** (`renderRequest` → an `Image`) fail with `RENDER_FAILED / INTERNAL`
+  on this host even with Caido's browser installed, so nothing was built on top of it.
+- **Testing a rule** (`testTamperRule`) takes a raw message plus the rule's section rebuilt as a
+  fifteen-branch union input. Testing an *existing* rule therefore means mapping its output
+  union back into an input union — more machinery than it answers, now that `rules` lists what
+  each rule does and `alteration` says which messages one touched.
+
+### Not covered
+
+`@caido/sdk-client` 0.5.0 exposes surface this client does not wrap, recorded here so it does not have to be rediscovered:
+
+- Workflows — list, get, create, update, delete, toggle, test and run (reached the SDK 2026-07-21)
+- Certificates — export the CA as PKCS#12, import, regenerate (2026-07-23)
+- DNS upstream resolvers and DNS rewrites
+- Sending or editing WebSocket messages, and WS replay sessions (`ReplaySessionWs`); reading streams is wrapped
+- Hosted-file upload and rename; plugin installation
+- `createRequest`, `deleteFindings`, and project create/rename/delete
+- Instance settings, which carry AI provider API keys — deliberately out of scope
+
 ## Setup
 
 Create a PAT in Caido Dashboard -> Developer -> Personal Access Tokens, then run:
