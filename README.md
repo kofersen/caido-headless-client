@@ -50,7 +50,7 @@ Checked 2026-08-10 against upstream **v3.2.0** (the `caido-mode-revamp` merge, P
 - **`export-curl --config`** — writes a reusable `-K` config per host holding the proxy line and every auth/identity header from a captured request, cookies inlined statically. Upstream's whole testing model is built on it: probe with `curl -K auth.cfg`, and use Replay only to hand a request to the operator. This client has `export-curl` in its self-contained form only.
 - **`test-mr-rule`** — preview a match-and-replace rule against a raw message without applying it. Deliberately skipped here (see *Checked and left out*), a decision worth revisiting now that upstream has built it.
 
-A third, `--name` on every session-creating command plus collections resolvable by name, landed here in `e96bd48` after upstream arrived at the same two changes independently.
+A third, `--name` on every session-creating command plus collections resolvable by name, landed here in `e96bd48` after upstream arrived at the same two changes independently. Upstream wraps neither WebSocket replay nor hosted-file upload, which this client gained in the same pass.
 
 The embedded GraphQL is field-checked against the canonical documents in [`caido/sdk-js`](https://github.com/caido/sdk-js) — `@caido/sdk-client` 0.5.0, generated from `@caido/schema-proxy` 0.57.0 — with no drift, since every document change between 0.4.0 and 0.5.0 was additive. Details under **Compatibility** above.
 
@@ -67,7 +67,8 @@ The embedded GraphQL is field-checked against the canonical documents in [`caido
 | Rate discipline | `--delay` paces sends per host across processes; 429, challenge, 503 and `Retry-After` are reported as `backoff` | no pacing, no backoff signal |
 | Scope | `search --scope` filters history by a Caido scope | not exposed |
 | Coverage | `sitemap` gives Caido's deduplicated tree of what has been seen on a host | not exposed |
-| WebSocket | `streams` and `stream-messages` read WS and SSE traffic with StreamQL filtering, which `search` cannot see | not exposed |
+| WebSocket | `streams` and `stream-messages` read WS and SSE traffic with StreamQL filtering, which `search` cannot see; `ws-connect` / `ws-send` / `ws-stop` open a WS replay session and push frames into it | not exposed |
+| Hosted files | `upload-hosted-file` serves a payload from the instance; list and delete alongside it | not exposed |
 | Proxy rewrites | full match-and-replace management; `get`, `search` and sends report `alteration` and `edited` | equivalent M&R management as of v3.2.0, plus `test-mr-rule` for previewing one; `alteration`/`edited` are not exposed, so a rule's effect reads as the target's behaviour |
 | Expired access token | refresh token is stored, rotated on the first auth failure, and the call retried | refresh token is never stored; the run exits telling you to re-run `setup <pat>` |
 | PAT on disk | `setup --no-save-pat` keeps it out of `secrets.json` | `setup` always writes the PAT |
@@ -99,15 +100,21 @@ Verified against the live schema on 2026-07-30, recorded so it is not re-researc
 
 ### Not covered
 
-`@caido/sdk-client` 0.5.0 exposes surface this client does not wrap, recorded here so it does not have to be rediscovered:
+Surface this client does not wrap, with the reason, so the question is not reopened every time.
+Checked against the live 0.57.1 schema on 2026-08-15.
 
-- Workflows — list, get, create, update, delete, toggle, test and run (reached the SDK 2026-07-21)
-- Certificates — export the CA as PKCS#12, import, regenerate (2026-07-23)
-- DNS upstream resolvers and DNS rewrites
-- Sending or editing WebSocket messages, and WS replay sessions (`ReplaySessionWs`); reading streams is wrapped
-- Hosted-file upload and rename; plugin installation
-- `createRequest`, `deleteFindings`, and project create/rename/delete
-- Instance settings, which carry AI provider API keys — deliberately out of scope
+| Not wrapped | Why |
+|---|---|
+| Certificate **export** | Not in the API. The schema has `importCertificate` and `regenerateCertificate` and no export of any kind, and no REST route serves the CA either. Nothing to wrap, whatever the SDK's surface list implies |
+| Certificate import / regenerate | Would replace or reissue the CA for the whole instance. A wrong call breaks every proxied client at once, and the UI is the safer place for a once-a-year action |
+| Workflows — list, create, update, toggle, test, run | An agent driving this client can express the same logic in the shell it is already in, and read the result directly instead of through a workflow's output |
+| DNS upstream resolvers and rewrites | `--connect-host`, `--connect-port` and `--sni` already redirect this client's own sends without touching the header. A rewrite only adds anything for *browser* traffic, which is a real but narrower case |
+| Hosted-file **rename** | `upload-hosted-file` and `delete-hosted-file` cover the lifecycle; a rename is a re-upload |
+| Plugin installation | Installs code into the operator's instance. Not an agent's call to make |
+| `createRequest` | Puts a request into history without sending it. Everything here is interested in what a target answered |
+| `deleteFindings` | Destructive, and findings are the record of the engagement |
+| Project create / rename / delete | Delete is destructive; create is genuinely useful given one-project-per-engagement, and is the most likely next addition |
+| Instance settings | They carry AI provider API keys. Deliberately out of scope |
 
 ## Setup
 

@@ -20,7 +20,7 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, resolve, join } from "node:path";
+import { basename, dirname, resolve, join } from "node:path";
 
 const DEBUG = process.env.DEBUG === "1";
 const DEFAULT_CAIDO_URL = "http://localhost:8080";
@@ -293,6 +293,44 @@ function isTransientError(err) {
   if (err?.name === "TimeoutError" || err?.name === "AbortError") return true;
   const text = String(err?.message || "").toLowerCase();
   return text.includes("fetch failed") || text.includes("econnreset") || text.includes("socket hang up");
+}
+
+/**
+ * The GraphQL multipart request spec, which is the only way to pass an Upload
+ * scalar. `operations` carries the document with a null where the file goes,
+ * `map` says which form part fills that null, and the part itself follows.
+ * FormData builds the boundaries, so nothing here is hand-rolled.
+ */
+async function rawGraphqlUpload(url, query, variables, filePath, timeoutMs = 120_000) {
+  const bytes = readFileSync(filePath);
+  const form = new FormData();
+  form.append("operations", JSON.stringify({ query, variables }));
+  form.append("map", JSON.stringify({ "0": ["variables.input.file"] }));
+  form.append("0", new Blob([bytes]), basename(filePath));
+
+  const headers = { accept: "application/json" };
+  if (this?.token) headers.authorization = `Bearer ${this.token}`;
+  const response = await fetch(graphqlUrl(url), {
+    method: "POST",
+    headers,
+    body: form,
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  const text = await response.text();
+  let payload;
+  try { payload = text ? JSON.parse(text) : {}; }
+  catch {
+    const err = new Error(`GraphQL upload returned non-JSON (${response.status}): ${text.slice(0, 300)}`);
+    err.status = response.status;
+    throw err;
+  }
+  if (!response.ok || payload.errors) {
+    const message = payload?.errors?.map((e) => e.message).join("; ") || response.statusText;
+    const err = new Error(`GraphQL upload HTTP ${response.status}: ${message}`);
+    err.status = response.status;
+    throw err;
+  }
+  return payload.data;
 }
 
 async function rawGraphql(url, query, variables = {}, accessToken, timeoutMs = 30_000) {
@@ -667,6 +705,11 @@ class CaidoClient {
       writeCaidoSecrets(secrets);
       return rawGraphql(this.url, query, variables, this.token);
     }
+  }
+
+  /** Uploads never retry: a resend would leave a second copy hosted. */
+  async graphqlUpload(query, variables, filePath) {
+    return rawGraphqlUpload.call(this, this.url, query, variables, filePath);
   }
 
   async health() {
@@ -1107,12 +1150,13 @@ async function getRequest(client, id, includeRequestRaw, includeResponseRaw) {
   return data.request;
 }
 
-async function createReplaySession(client, requestSource, collectionId) {
+async function createReplaySession(client, requestSource, collectionId, kind = "HTTP") {
   const version = await client.getServerVersion();
   const isV057 = versionGte(version, CAIDO_V057);
   const input = { requestSource };
   if (collectionId) input.collectionId = collectionId;
-  if (isV057) input.kind = "HTTP";
+  if (isV057) input.kind = kind;
+  else if (kind !== "HTTP") die(`WebSocket replay needs Caido 0.57 or newer; this instance is ${version}`);
   const mutation = isV057 ? CREATE_REPLAY_SESSION_V057 : CREATE_REPLAY_SESSION;
   const data = await client.graphql(mutation, { input });
   return requirePayload(data.createReplaySession, "session", "createReplaySession");
@@ -1297,8 +1341,8 @@ async function resolveSessionId(client, idOrName) {
  * A session created unnamed is a tab nobody can find later, so every command
  * that creates one takes --name and applies it before the first send.
  */
-async function createNamedReplaySession(client, requestSource, collectionId, name) {
-  const session = await createReplaySession(client, requestSource, collectionId);
+async function createNamedReplaySession(client, requestSource, collectionId, name, kind = "HTTP") {
+  const session = await createReplaySession(client, requestSource, collectionId, kind);
   return name ? await renameReplaySession(client, session.id, name) : session;
 }
 
@@ -2475,6 +2519,48 @@ async function cmdHostedFiles() {
   printJson((await (await getClient()).graphql(HOSTED_FILES_QUERY)).hostedFiles);
 }
 
+async function cmdUploadHostedFile(filePath, name) {
+  const path = resolve(filePath);
+  if (!existsSync(path)) die(`File ${path} not found`);
+  const client = await getClient();
+  const data = await client.graphqlUpload(UPLOAD_HOSTED_FILE, { input: { name: name || basename(path), file: null } }, path);
+  const file = requirePayload(data.uploadHostedFile, "hostedFile", "uploadHostedFile");
+  printJson({ ...file, uploaded: true });
+}
+
+/**
+ * A WebSocket replay session is opened from the HTTP upgrade request that
+ * started the stream, then a task holds the socket open. The task id is what
+ * every later send needs, so it is the thing this prints.
+ */
+async function cmdWsConnect(requestId, collection, sessionName) {
+  const client = await getClient();
+  const collectionId = await resolveCollectionId(client, collection);
+  const session = await createNamedReplaySession(client, { id: requestId }, collectionId, sessionName, "WS");
+  const data = await client.graphql(START_REPLAY_TASK, { sessionId: session.id });
+  const payload = data.startReplayTask;
+  if (payload?.error) die(`Could not start the WebSocket task: ${payload.error.__typename}`);
+  const task = requirePayload(payload, "task", "startReplayTask");
+  printJson({ sessionId: session.id, sessionName: session.name, taskId: task.id, sessionKind: task.sessionKind });
+}
+
+async function cmdWsSend(taskId, data, direction, format) {
+  const client = await getClient();
+  const text = await resolveRaw(data);
+  const result = await client.graphql(SEND_REPLAY_TASK_MESSAGE, {
+    task: taskId,
+    input: { ws: { direction, format, data: encodeRaw(text) } },
+  });
+  const payload = result.sendReplayTaskMessage;
+  if (payload?.error) die(`Send refused: ${payload.error.__typename}`);
+  printJson({ taskId, direction, format, message: payload?.message });
+}
+
+async function cmdWsStop(taskIds) {
+  const data = await (await getClient()).graphql(STOP_REPLAY_WS_TASKS, { taskIds });
+  printJson({ stopped: data.stopReplayWsTasks?.taskIds || taskIds });
+}
+
 async function cmdDeleteHostedFile(fileId) {
   await (await getClient()).graphql(DELETE_HOSTED_FILE, { id: fileId });
   printJson({ deleted: fileId });
@@ -2650,6 +2736,9 @@ Other:
   sitemap [host] [--scope s] [--all] [--limit n]   what has been seen on a host
   streams [--limit n] [--scope s] [--filter streamql]
   stream-messages <stream-id> [--limit n] [--raw] [--filter streamql] [output options]
+  ws-connect <upgrade-request-id> [--name name] [--collection id-or-name]
+  ws-send <task-id> <str|@file|-> [--direction client|server] [--format text|binary|ping|pong|close]
+  ws-stop <task-id,task-id,...>
   rules                   list match-and-replace rules rewriting traffic
   create-rule <name> --section <s> [--op raw|add|update|remove]
               [--match v | --match-regex re | --match-full | --match-name h]
@@ -2663,7 +2752,7 @@ Other:
   scopes | create-scope | update-scope | delete-scope
   filters | create-filter | update-filter | delete-filter
   envs | create-env | select-env | env-set | delete-env
-  projects | select-project | hosted-files | delete-hosted-file
+  projects | select-project | hosted-files | upload-hosted-file <path> [--name n] | delete-hosted-file
   tasks | cancel-task | intercept-status | intercept-enable | intercept-disable
   viewer | plugins | health | setup | auth-status
 
@@ -3071,6 +3160,36 @@ async function main() {
       break;
     }
     case "hosted-files": await cmdHostedFiles(); break;
+    case "upload-hosted-file": {
+      if (!args[1]) die("Error: file path required");
+      let name;
+      for (let i = 2; i < args.length; i++) if (args[i] === "--name" && args[i + 1]) { name = args[i + 1]; i++; }
+      await cmdUploadHostedFile(args[1], name);
+      break;
+    }
+    case "ws-connect": {
+      if (!args[1]) die("Error: request-id of the WebSocket upgrade required");
+      await cmdWsConnect(args[1], parseCollectionId(args, 2), parseSessionName(args, 2));
+      break;
+    }
+    case "ws-send": {
+      if (!args[1] || !args[2]) die("Error: task-id and data required (str, @file or - for stdin)");
+      let direction = "CLIENT";
+      let format = "TEXT";
+      for (let i = 3; i < args.length; i++) {
+        if (args[i] === "--direction" && args[i + 1]) { direction = args[i + 1].toUpperCase(); i++; }
+        else if (args[i] === "--format" && args[i + 1]) { format = args[i + 1].toUpperCase(); i++; }
+      }
+      if (!["CLIENT", "SERVER"].includes(direction)) die("Error: --direction is client or server");
+      if (!["TEXT", "BINARY", "PING", "PONG", "CLOSE"].includes(format)) die("Error: --format is text, binary, ping, pong or close");
+      await cmdWsSend(args[1], args[2], direction, format);
+      break;
+    }
+    case "ws-stop": {
+      if (!args[1]) die("Error: comma-separated task ids required");
+      await cmdWsStop(args[1].split(",").map((t) => t.trim()).filter(Boolean));
+      break;
+    }
     case "delete-hosted-file": {
       if (!args[1]) die("Error: hosted file id required");
       await cmdDeleteHostedFile(args[1]);
@@ -3688,6 +3807,34 @@ query HostedFiles {
 }`;
 
 const DELETE_HOSTED_FILE = `mutation DeleteHostedFile($id: ID!) { deleteHostedFile(id: $id) { deletedId } }`;
+
+const UPLOAD_HOSTED_FILE = `
+mutation UploadHostedFile($input: UploadHostedFileInput!) {
+  uploadHostedFile(input: $input) {
+    hostedFile { id name path size status createdAt updatedAt }
+  }
+}`;
+
+const START_REPLAY_TASK = `
+mutation StartReplayTask($sessionId: ID!) {
+  startReplayTask(sessionId: $sessionId) {
+    task { id createdAt sessionKind replayEntry { id error } }
+    error { __typename ... on OtherUserError { code } }
+  }
+}`;
+
+const SEND_REPLAY_TASK_MESSAGE = `
+mutation SendReplayTaskMessage($task: ID!, $input: SendReplayTaskMessageInput!) {
+  sendReplayTaskMessage(task: $task, input: $input) {
+    message { ... on StreamWsMessage { id direction format length createdAt } }
+    error { __typename ... on OtherUserError { code } }
+  }
+}`;
+
+const STOP_REPLAY_WS_TASKS = `
+mutation StopReplayWsTasks($taskIds: [ID!]!) {
+  stopReplayWsTasks(taskIds: $taskIds) { taskIds }
+}`;
 
 const VIEWER_QUERY = `
 query Viewer {
