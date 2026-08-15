@@ -2385,14 +2385,18 @@ async function cmdGetFinding(findingId) {
 }
 
 /**
- * Ids only. The mutation also accepts a `reporter`, which deletes everything
- * that reporter ever filed, and both of its fields are optional — an empty
- * input is one keystroke from clearing the engagement's record. Naming each id
- * is the same contract every other delete here keeps.
+ * Both fields of the input are optional, so an empty one asks the server to
+ * delete on no criteria at all. That is the case worth refusing, not `reporter`
+ * itself: this client stamps every finding it files with `caido-mode`, which
+ * makes `--reporter caido-mode` the precise "undo what the agent filed" and
+ * leaves Caido's own scanner findings alone.
  */
-async function cmdDeleteFindings(ids) {
-  const data = await (await getClient()).graphql(DELETE_FINDINGS, { input: { ids } });
-  printJson({ deleted: data.deleteFindings?.deletedIds || ids });
+async function cmdDeleteFindings(ids, reporter) {
+  if (!ids?.length && !reporter) die("Error: delete-findings needs <id,id,...> or --reporter <name>");
+  const data = await (await getClient()).graphql(DELETE_FINDINGS, {
+    input: compactUndefined({ ids: ids?.length ? ids : undefined, reporter }),
+  });
+  printJson({ deleted: data.deleteFindings?.deletedIds || ids || [] });
 }
 
 async function cmdCreateFinding(requestId, title, description, reporter, dedupeKey) {
@@ -2524,11 +2528,13 @@ async function cmdProjects() {
   printJson((await (await getClient()).graphql(PROJECTS_QUERY)).projects);
 }
 
-async function cmdSelectProject(projectId) {
-  const data = await (await getClient()).graphql(SELECT_PROJECT, { id: projectId });
+async function cmdSelectProject(idOrName) {
+  const client = await getClient();
+  const id = await resolveProjectId(client, idOrName);
+  const data = await client.graphql(SELECT_PROJECT, { id });
   const err = firstPayloadError(data.selectProject);
   if (err) throw new Error(`selectProject failed: ${err}`);
-  printJson({ selected: projectId });
+  printJson({ selected: id });
 }
 
 async function cmdHostedFiles() {
@@ -2900,11 +2906,11 @@ Other:
   delete-rule <id>
   create-rule-collection <name> | rename-rule-collection <id> <name>
   delete-rule-collection <id>
-  findings | get-finding | create-finding | update-finding | delete-findings <id,id,...>
+  findings | get-finding | create-finding | update-finding | delete-findings <id,id,...>|--reporter name
   scopes | create-scope | update-scope | delete-scope
   filters | create-filter | update-filter | delete-filter
   envs | create-env | select-env | env-set | delete-env
-  projects | select-project | hosted-files | upload-hosted-file <path> [--name n] | delete-hosted-file
+  projects | select-project <id-or-name> | hosted-files | upload-hosted-file <path> [--name n] | delete-hosted-file
   create-project <name> [--temporary] | rename-project <id-or-name> <new> | persist-project <id-or-name> | delete-project <id-or-name>
 
 DNS:
@@ -3223,8 +3229,10 @@ async function main() {
       break;
     }
     case "delete-findings": {
-      if (!args[1]) die("Error: comma-separated finding ids required");
-      await cmdDeleteFindings(splitList(args[1]));
+      let reporter;
+      for (let i = 1; i < args.length; i++) if (args[i] === "--reporter" && args[i + 1]) { reporter = args[i + 1]; i++; }
+      const ids = args[1] && !args[1].startsWith("--") ? splitList(args[1]) : [];
+      await cmdDeleteFindings(ids, reporter);
       break;
     }
     case "update-finding": {
@@ -3243,7 +3251,7 @@ async function main() {
     }
     case "projects": await cmdProjects(); break;
     case "select-project": {
-      if (!args[1]) die("Error: project id required");
+      if (!args[1]) die("Error: project id or name required");
       await cmdSelectProject(args[1]);
       break;
     }
