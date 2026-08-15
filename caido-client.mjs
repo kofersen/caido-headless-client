@@ -2384,6 +2384,17 @@ async function cmdGetFinding(findingId) {
   printJson(data.finding);
 }
 
+/**
+ * Ids only. The mutation also accepts a `reporter`, which deletes everything
+ * that reporter ever filed, and both of its fields are optional — an empty
+ * input is one keystroke from clearing the engagement's record. Naming each id
+ * is the same contract every other delete here keeps.
+ */
+async function cmdDeleteFindings(ids) {
+  const data = await (await getClient()).graphql(DELETE_FINDINGS, { input: { ids } });
+  printJson({ deleted: data.deleteFindings?.deletedIds || ids });
+}
+
 async function cmdCreateFinding(requestId, title, description, reporter, dedupeKey) {
   const data = await (await getClient()).graphql(CREATE_FINDING, {
     requestId,
@@ -2889,7 +2900,7 @@ Other:
   delete-rule <id>
   create-rule-collection <name> | rename-rule-collection <id> <name>
   delete-rule-collection <id>
-  findings | get-finding | create-finding | update-finding
+  findings | get-finding | create-finding | update-finding | delete-findings <id,id,...>
   scopes | create-scope | update-scope | delete-scope
   filters | create-filter | update-filter | delete-filter
   envs | create-env | select-env | env-set | delete-env
@@ -3209,6 +3220,11 @@ async function main() {
       }
       if (!title) die("Error: --title required");
       await cmdCreateFinding(args[1], title, desc, reporter, dedupeKey);
+      break;
+    }
+    case "delete-findings": {
+      if (!args[1]) die("Error: comma-separated finding ids required");
+      await cmdDeleteFindings(splitList(args[1]));
       break;
     }
     case "update-finding": {
@@ -3942,6 +3958,11 @@ const FINDING_QUERY = `
 ${FINDING_FRAGMENT}
 query Finding($id: ID!) {
   finding(id: $id) { ...FindingFull }
+}`;
+
+const DELETE_FINDINGS = `
+mutation DeleteFindings($input: DeleteFindingsInput!) {
+  deleteFindings(input: $input) { deletedIds }
 }`;
 
 const CREATE_FINDING = `

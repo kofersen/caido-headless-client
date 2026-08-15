@@ -112,8 +112,7 @@ Checked against the live 0.57.1 schema on 2026-08-15.
 | Workflows — list, create, update, toggle, test, run | An agent driving this client can express the same logic in the shell it is already in, and read the result directly instead of through a workflow's output |
 | Hosted-file **rename** | `upload-hosted-file` and `delete-hosted-file` cover the lifecycle; a rename is a re-upload |
 | Plugin installation | Installs code into the operator's instance. Not an agent's call to make |
-| `createRequest` | Puts a request into history without sending it. Everything here is interested in what a target answered |
-| `deleteFindings` | Destructive, and findings are the record of the engagement |
+| `createRequest` | Writes a request **and an optional response** into history without sending anything, tagged with any `source` and `alteration` you choose. That is a forgery primitive: `evidence` exports out of history into a report bundle, and nothing downstream would mark the entry as synthetic. Importing a capture taken elsewhere is a real use, but not one worth a command that can manufacture evidence |
 | Instance settings | They carry AI provider API keys. Deliberately out of scope |
 
 ## Setup
