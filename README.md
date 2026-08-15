@@ -122,6 +122,21 @@ carry cookies and authorization headers. The whole set is checked before anythin
 so a conflict never leaves half a bundle, and a symlink target is refused even with `--force`.
 `request.http` and `response.http` are the stored bytes; `curl.sh` is a reconstruction.
 
+Name a replay tab when you open it, and address collections by name:
+
+```bash
+node caido-client.mjs edit <request-id> --path /api/user/999 --name "idor-user-profile" --collection "IDOR"
+node caido-client.mjs create-session <request-id> --name "idor-user-profile" --collection "IDOR"
+node caido-client.mjs edit <request-id> --path /api/user/1000 --session "idor-user-profile"
+```
+
+`replay`, `edit`, `send-raw` and `create-session` all take `--name`, which is applied before
+the first send, so a tab is never created unnamed. `--collection` takes a collection's name or
+its id, and so do `move-session`, `rename-collection` and `delete-collection`; `--session`,
+`rename-session` and `delete-sessions` take a session's name or id. Nothing has to be looked up
+before it can be used. `--name` alongside `--session` is refused, because that tab already
+exists and naming it there would silently rename someone else's work — use `rename-session`.
+
 Send one request per value:
 
 ```bash

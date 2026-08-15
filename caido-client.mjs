@@ -1266,6 +1266,42 @@ async function resolveSession(client, idOrName) {
   return undefined;
 }
 
+/**
+ * Accepts a replay collection's id or its name. Collections are created by hand
+ * and referred to by the name on the tab, so requiring an id here meant a lookup
+ * before every send, which is why grouping got skipped.
+ */
+async function resolveCollectionId(client, idOrName) {
+  if (!idOrName) return undefined;
+  const nodes = [];
+  let after;
+  while (true) {
+    const page = await client.graphql(REPLAY_COLLECTIONS_QUERY, { first: 100, after });
+    for (const edge of page.replaySessionCollections.edges) nodes.push(edge.node);
+    if (!page.replaySessionCollections.pageInfo.hasNextPage) break;
+    after = page.replaySessionCollections.pageInfo.endCursor;
+  }
+  const match = nodes.find((n) => n.id === idOrName) || nodes.find((n) => n.name === idOrName);
+  if (!match) die(`Collection "${idOrName}" not found. Run: caido-client.mjs replay-collections`);
+  return match.id;
+}
+
+/** Accepts a session's id or its name, and fails with the id, not a GraphQL error. */
+async function resolveSessionId(client, idOrName) {
+  const session = await resolveSession(client, idOrName);
+  if (!session) die(`Replay session "${idOrName}" not found. Run: caido-client.mjs replay-sessions`);
+  return session.id;
+}
+
+/**
+ * A session created unnamed is a tab nobody can find later, so every command
+ * that creates one takes --name and applies it before the first send.
+ */
+async function createNamedReplaySession(client, requestSource, collectionId, name) {
+  const session = await createReplaySession(client, requestSource, collectionId);
+  return name ? await renameReplaySession(client, session.id, name) : session;
+}
+
 /** Accepts a scope id or its name, so callers do not have to look the id up first. */
 async function resolveScopeId(client, idOrName) {
   const scopes = (await client.graphql(SCOPES_QUERY, {})).scopes || [];
@@ -1391,11 +1427,12 @@ async function cmdExportCurl(requestId) {
   console.log(rawToCurl(raw, request.host, request.port, request.isTls));
 }
 
-async function cmdReplay(requestId, rawOverride, opts, overrides, collectionId) {
+async function cmdReplay(requestId, rawOverride, opts, overrides, collection, sessionName) {
   const client = await getClient();
   const original = await getRequest(client, requestId, true, false);
   if (!original) die(`Request ${requestId} not found`);
-  const session = await createReplaySession(client, { id: requestId }, collectionId);
+  const collectionId = await resolveCollectionId(client, collection);
+  const session = await createNamedReplaySession(client, { id: requestId }, collectionId, sessionName);
   const raw = rawOverride ? await resolveRaw(rawOverride) : decodeRaw(original.raw);
   if (!raw) die("No raw data for this request");
   const connection = buildConnection(original.host, original.port, original.isTls, overrides);
@@ -1403,17 +1440,18 @@ async function cmdReplay(requestId, rawOverride, opts, overrides, collectionId) 
   printJson(buildReplayOutput(session.id, result, opts));
 }
 
-async function cmdSendRaw(host, port, tls, raw, opts, overrides, collectionId, sessionName) {
+async function cmdSendRaw(host, port, tls, raw, opts, overrides, collection, sessionName) {
   const client = await getClient();
   raw = await resolveRaw(raw);
   const connection = buildConnection(host, port, tls, overrides);
-  const session = await createReplaySession(client, { raw: { connectionInfo: connection, raw: encodeRaw(raw) } }, collectionId);
-  const finalSession = sessionName ? await renameReplaySession(client, session.id, sessionName) : session;
-  const result = await sendReplay(client, finalSession.id, raw, connection);
-  printJson(buildReplayOutput(finalSession.id, result, opts));
+  const collectionId = await resolveCollectionId(client, collection);
+  const source = { raw: { connectionInfo: connection, raw: encodeRaw(raw) } };
+  const session = await createNamedReplaySession(client, source, collectionId, sessionName);
+  const result = await sendReplay(client, session.id, raw, connection);
+  printJson(buildReplayOutput(session.id, result, opts));
 }
 
-async function cmdEdit(requestId, edits, opts, overrides, collectionId) {
+async function cmdEdit(requestId, edits, opts, overrides, collection, sessionName) {
   const client = await getClient();
   const original = await getRequest(client, requestId, true, false);
   if (!original) die(`Request ${requestId} not found`);
@@ -1421,8 +1459,8 @@ async function cmdEdit(requestId, edits, opts, overrides, collectionId) {
   if (!raw) die("No raw data for this request");
   const modifiedRaw = applyRawEdits(raw, edits);
   const session = edits.sessionId
-    ? { id: edits.sessionId }
-    : await createReplaySession(client, { id: requestId }, collectionId);
+    ? { id: await resolveSessionId(client, edits.sessionId) }
+    : await createNamedReplaySession(client, { id: requestId }, await resolveCollectionId(client, collection), sessionName);
   const connection = buildConnection(original.host, original.port, original.isTls, overrides);
   const result = await sendReplay(client, session.id, modifiedRaw, connection);
   printJson(buildReplayOutput(session.id, result, opts, modifiedRaw));
@@ -1476,7 +1514,7 @@ function editsContainPlaceholder(edits) {
  * error rather than working through the rest of the list against a target that
  * has started refusing.
  */
-async function cmdEditBatch(requestId, edits, values, opts, overrides, collectionId, delayMs) {
+async function cmdEditBatch(requestId, edits, values, opts, overrides, collection, delayMs, sessionName) {
   if (!editsContainPlaceholder(edits)) {
     die(`Error: --values needs a ${VALUE_PLACEHOLDER} placeholder in --method, --path, --body, --set-header or --replace`);
   }
@@ -1490,8 +1528,8 @@ async function cmdEditBatch(requestId, edits, values, opts, overrides, collectio
   if (!raw) die("No raw data for this request");
 
   const session = edits.sessionId
-    ? { id: edits.sessionId }
-    : await createReplaySession(client, { id: requestId }, collectionId);
+    ? { id: await resolveSessionId(client, edits.sessionId) }
+    : await createNamedReplaySession(client, { id: requestId }, await resolveCollectionId(client, collection), sessionName);
   const connection = buildConnection(original.host, original.port, original.isTls, overrides);
 
   const results = [];
@@ -2199,18 +2237,23 @@ async function cmdReplaySessions(limit) {
   printJson({ results, count: results.length });
 }
 
-async function cmdCreateSession(requestId, collectionId) {
-  const session = await createReplaySession(await getClient(), { id: requestId }, collectionId);
+async function cmdCreateSession(requestId, collection, sessionName) {
+  const client = await getClient();
+  const collectionId = await resolveCollectionId(client, collection);
+  const session = await createNamedReplaySession(client, { id: requestId }, collectionId, sessionName);
   printJson(sessionOutput(session));
 }
 
-async function cmdRenameSession(sessionId, name) {
-  const session = await renameReplaySession(await getClient(), sessionId, name);
+async function cmdRenameSession(sessionIdOrName, name) {
+  const client = await getClient();
+  const session = await renameReplaySession(client, await resolveSessionId(client, sessionIdOrName), name);
   printJson({ ...sessionOutput(session), renamed: true });
 }
 
-async function cmdMoveSession(sessionId, collectionId) {
+async function cmdMoveSession(sessionIdOrName, collection) {
   const client = await getClient();
+  const sessionId = await resolveSessionId(client, sessionIdOrName);
+  const collectionId = await resolveCollectionId(client, collection);
   const version = await client.getServerVersion();
   const mutation = versionGte(version, CAIDO_V057) ? MOVE_REPLAY_SESSION_V057 : MOVE_REPLAY_SESSION;
   const data = await client.graphql(mutation, { id: sessionId, collectionId });
@@ -2218,8 +2261,11 @@ async function cmdMoveSession(sessionId, collectionId) {
   printJson({ ...sessionOutput(session), moved: true });
 }
 
-async function cmdDeleteSessions(ids) {
-  const data = await (await getClient()).graphql(DELETE_REPLAY_SESSIONS, { ids });
+async function cmdDeleteSessions(idsOrNames) {
+  const client = await getClient();
+  const ids = [];
+  for (const one of idsOrNames) ids.push(await resolveSessionId(client, one));
+  const data = await client.graphql(DELETE_REPLAY_SESSIONS, { ids });
   printJson({ deleted: data.deleteReplaySessions.deletedIds || ids });
 }
 
@@ -2235,15 +2281,19 @@ async function cmdCreateCollection(name) {
   printJson({ id: collection.id, name: collection.name });
 }
 
-async function cmdRenameCollection(collectionId, name) {
-  const data = await (await getClient()).graphql(RENAME_REPLAY_COLLECTION, { id: collectionId, name });
+async function cmdRenameCollection(collectionIdOrName, name) {
+  const client = await getClient();
+  const id = await resolveCollectionId(client, collectionIdOrName);
+  const data = await client.graphql(RENAME_REPLAY_COLLECTION, { id, name });
   const collection = requirePayload(data.renameReplaySessionCollection, "collection", "renameReplaySessionCollection");
   printJson({ id: collection.id, name: collection.name, renamed: true });
 }
 
-async function cmdDeleteCollection(collectionId) {
-  await (await getClient()).graphql(DELETE_REPLAY_COLLECTION, { id: collectionId });
-  printJson({ deleted: collectionId });
+async function cmdDeleteCollection(collectionIdOrName) {
+  const client = await getClient();
+  const id = await resolveCollectionId(client, collectionIdOrName);
+  await client.graphql(DELETE_REPLAY_COLLECTION, { id });
+  printJson({ deleted: id });
 }
 
 async function cmdCreateAutomateSession(requestId) {
@@ -2578,23 +2628,23 @@ HTTP history:
   evidence <request-id> --out dir [--finding id] [--force]
 
 Replay:
-  replay <request-id> [--raw str|@file|-] [--collection id] [connection options] [output options]
-  send-raw --host host --raw str|@file|- [--port n] [--tls|--no-tls] [--name name] [--collection id] [connection options] [output options]
-  edit <request-id> [--method M] [--path p] [--set-header "N: V"] [--remove-header N] [--body b] [--replace from:::to] [--session id] [--collection id] [--values 1-100|a,b,c|@file] [connection options] [output options]
+  replay <request-id> [--raw str|@file|-] [--name name] [--collection id-or-name] [connection options] [output options]
+  send-raw --host host --raw str|@file|- [--port n] [--tls|--no-tls] [--name name] [--collection id-or-name] [connection options] [output options]
+  edit <request-id> [--method M] [--path p] [--set-header "N: V"] [--remove-header N] [--body b] [--replace from:::to] [--session id-or-name] [--name name] [--collection id-or-name] [--values 1-100|a,b,c|@file] [connection options] [output options]
   get-session <id-or-name> [output options]
   replay-entries <id-or-name> [--limit n] [--raw] [output options]
   edit-session <id-or-name> [edit options] [connection options] [output options]
 
 Sessions and collections:
-  create-session <request-id> [--collection id]
-  rename-session <id> <name>
-  move-session <id> <collection-id>
+  create-session <request-id> [--name name] [--collection id-or-name]
+  rename-session <id-or-name> <new-name>
+  move-session <id-or-name> <collection-id-or-name>
   replay-sessions [--limit n]
-  delete-sessions <id,id,...>
+  delete-sessions <id-or-name,id-or-name,...>
   replay-collections [--limit n]
   create-collection <name>
-  rename-collection <id> <name>
-  delete-collection <id>
+  rename-collection <id-or-name> <new-name>
+  delete-collection <id-or-name>
 
 Other:
   sitemap [host] [--scope s] [--all] [--limit n]   what has been seen on a host
@@ -2700,7 +2750,7 @@ async function main() {
       if (!args[1]) die("Error: request-id required");
       let rawOverride;
       for (let i = 2; i < args.length; i++) if (args[i] === "--raw" && args[i + 1]) { rawOverride = args[i + 1]; i++; }
-      await cmdReplay(args[1], rawOverride, parseOutputOpts(args, 2), parseConnectionOverrides(args, 2), parseCollectionId(args, 2));
+      await cmdReplay(args[1], rawOverride, parseOutputOpts(args, 2), parseConnectionOverrides(args, 2), parseCollectionId(args, 2), parseSessionName(args, 2));
       break;
     }
     case "send-raw": {
@@ -2740,6 +2790,10 @@ async function main() {
         else if (args[i] === "--values") { valueSpec = requireFlagValue(args, i, "--values"); i++; }
       }
       const edits = { method, path, body, setHeaders, removeHeaders, replacements, sessionId };
+      const sessionName = parseSessionName(args, 2);
+      // --name names the tab this command opens. With --session the tab already
+      // exists, so a name there would be a silent rename of someone else's tab.
+      if (sessionName && sessionId) die("Error: --name names a new session; with --session use rename-session");
       if (valueSpec !== undefined) {
         await cmdEditBatch(
           args[1],
@@ -2749,9 +2803,10 @@ async function main() {
           parseConnectionOverrides(args, 2),
           parseCollectionId(args, 2),
           MIN_INTERVAL_MS ?? DEFAULT_BATCH_DELAY_MS,
+          sessionName,
         );
       } else {
-        await cmdEdit(args[1], edits, parseOutputOpts(args, 2), parseConnectionOverrides(args, 2), parseCollectionId(args, 2));
+        await cmdEdit(args[1], edits, parseOutputOpts(args, 2), parseConnectionOverrides(args, 2), parseCollectionId(args, 2), sessionName);
       }
       break;
     }
@@ -2835,7 +2890,7 @@ async function main() {
     }
     case "create-session": {
       if (!args[1]) die("Error: request-id required");
-      await cmdCreateSession(args[1], parseCollectionId(args, 2));
+      await cmdCreateSession(args[1], parseCollectionId(args, 2), parseSessionName(args, 2));
       break;
     }
     case "rename-session": {
