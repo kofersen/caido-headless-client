@@ -1110,8 +1110,14 @@ function formatReplayEntry(entry, opts, includeRaw) {
   }
 
   if (includeRaw) {
-    if (entry.raw) output.raw = formatHttpRaw(decodeRaw(entry.raw), opts);
-    if (request?.raw) output.request.raw = formatHttpRaw(decodeRaw(request.raw), opts);
+    // --no-request, and so --compact, suppress the request side here as they do
+    // everywhere else. It matters more here than anywhere: a replay entry's raw
+    // is a full authenticated request, and its Cookie header is the one thing
+    // no body limit touches.
+    if (!opts.noRequest) {
+      if (entry.raw) output.raw = formatHttpRaw(decodeRaw(entry.raw), opts);
+      if (request?.raw) output.request.raw = formatHttpRaw(decodeRaw(request.raw), opts);
+    }
     if (response?.raw) output.response.raw = formatHttpRaw(decodeRaw(response.raw), opts);
   }
 
