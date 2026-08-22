@@ -50,6 +50,21 @@ const MAX_BATCH_VALUES = 1000;
 // values only invite timer overflow.
 const MAX_DELAY_MS = 300_000;
 
+// The PwnFox workflow stores these values in Request.metadata.color. HTTPQL
+// cannot address that metadata, so --color scans bounded GraphQL pages and
+// compares the stored value client-side.
+const PWNFOX_COLORS = Object.freeze({
+  yellow: "#d99e4a",
+  red: "#e70606",
+  orange: "#e79106",
+  green: "#6ce706",
+  magenta: "#b406e7",
+  cyan: "#31cd6f",
+  blue: "#4094bf",
+});
+const DEFAULT_COLOR_SCAN_LIMIT = 5000;
+const MAX_COLOR_UPDATES = 1000;
+
 // Response headers that differ on every response and would otherwise fill the
 // compare output with noise. --all-headers keeps them.
 const VOLATILE_HEADERS = new Set([
@@ -122,6 +137,19 @@ function compactUndefined(value) {
     return out;
   }
   return value;
+}
+
+function pwnfoxColorValue(name) {
+  const normalized = String(name || "").toLowerCase();
+  const value = PWNFOX_COLORS[normalized];
+  if (!value) die(`Error: unknown PwnFox color "${name}". One of: ${Object.keys(PWNFOX_COLORS).join(", ")}`);
+  return { name: normalized, value };
+}
+
+function requestColorName(value) {
+  if (!value) return undefined;
+  const normalized = String(value).toLowerCase();
+  return Object.entries(PWNFOX_COLORS).find(([, hex]) => hex === normalized)?.[0] || value;
 }
 
 function parseOutputOpts(args, startIdx) {
@@ -1043,6 +1071,7 @@ function requestOutput(node, opts, includeResponse = true) {
     port: node.port,
     isTls: node.isTls,
     createdAt: node.createdAt,
+    color: requestColorName(node.metadata?.color),
     ...alterationFields(node),
   };
   if (!opts.noRequest && node.raw) output.raw = formatHttpRaw(decodeRaw(node.raw), opts);
@@ -1365,19 +1394,79 @@ async function resolveScopeId(client, idOrName) {
   return match.id;
 }
 
-async function cmdSearch(filter, limit, after, idsOnly, desc, scope) {
+async function cmdSearch(filter, limit, after, idsOnly, desc, scope, color, scanLimit) {
   const client = await getClient();
   const scopeId = scope ? await resolveScopeId(client, scope) : undefined;
-  const data = await client.graphql(REQUESTS_QUERY, {
-    first: limit,
-    after,
-    filter: filter ? { code: filter } : undefined,
-    order: desc ? { by: "ID", ordering: "DESC" } : undefined,
-    scopeId,
-    includeRequestRaw: false,
-    includeResponseRaw: false,
-  });
-  const edges = data.requests.edges;
+  let edges;
+  let pageInfo;
+  let scanned;
+  let scanLimitReached = false;
+  let selectedColor;
+
+  if (!color) {
+    const data = await client.graphql(REQUESTS_QUERY, {
+      first: limit,
+      after,
+      filter: filter ? { code: filter } : undefined,
+      order: desc ? { by: "ID", ordering: "DESC" } : undefined,
+      scopeId,
+      includeRequestRaw: false,
+      includeResponseRaw: false,
+    });
+    edges = data.requests.edges;
+    pageInfo = data.requests.pageInfo;
+  } else {
+    selectedColor = pwnfoxColorValue(color);
+    const matches = [];
+    let cursor = after;
+    let startCursor;
+    let hasPreviousPage = false;
+    let hasNextPage = false;
+    scanned = 0;
+
+    search: while (scanned < scanLimit && matches.length < limit) {
+      const data = await client.graphql(REQUESTS_QUERY, {
+        first: Math.min(100, scanLimit - scanned),
+        after: cursor,
+        filter: filter ? { code: filter } : undefined,
+        order: desc ? { by: "ID", ordering: "DESC" } : undefined,
+        scopeId,
+        includeRequestRaw: false,
+        includeResponseRaw: false,
+      });
+      const page = data.requests;
+      hasPreviousPage ||= page.pageInfo.hasPreviousPage;
+      if (!page.edges.length) break;
+
+      for (let index = 0; index < page.edges.length; index++) {
+        const edge = page.edges[index];
+        startCursor ??= edge.cursor;
+        cursor = edge.cursor;
+        scanned++;
+        if (String(edge.node.metadata?.color || "").toLowerCase() === selectedColor.value) matches.push(edge);
+        if (matches.length === limit || scanned === scanLimit) {
+          hasNextPage = index < page.edges.length - 1 || page.pageInfo.hasNextPage;
+          scanLimitReached = scanned === scanLimit && hasNextPage;
+          break search;
+        }
+      }
+
+      hasNextPage = page.pageInfo.hasNextPage;
+      if (!hasNextPage) break;
+    }
+
+    edges = matches;
+    pageInfo = {
+      hasNextPage,
+      hasPreviousPage,
+      startCursor: startCursor || null,
+      endCursor: cursor || null,
+    };
+  }
+
+  if (scanLimitReached) {
+    console.error(`Warning: --color ${selectedColor.name} scanned ${scanLimit} rows; continue with --after ${pageInfo.endCursor} or raise --scan-limit.`);
+  }
   if (idsOnly) {
     console.log(JSON.stringify(edges.map((e) => e.node.id)));
     return;
@@ -1394,10 +1483,73 @@ async function cmdSearch(filter, limit, after, idsOnly, desc, scope) {
     roundtrip: e.node.response?.roundtripTime,
     responseLength: e.node.response?.length,
     createdAt: e.node.createdAt,
+    color: requestColorName(e.node.metadata?.color),
     ...alterationFields(e.node),
     cursor: e.cursor,
   }));
-  printJson({ results, pageInfo: data.requests.pageInfo, count: results.length });
+  printJson(compactUndefined({
+    results,
+    pageInfo,
+    count: results.length,
+    color: selectedColor?.name,
+    scanned,
+    scanLimitReached: color ? scanLimitReached : undefined,
+  }));
+}
+
+async function requestIdsForColorUpdate(client, filter, scopeId, limit) {
+  const ids = [];
+  let after;
+
+  while (ids.length <= limit) {
+    const data = await client.graphql(REQUESTS_QUERY, {
+      first: Math.min(100, limit + 1 - ids.length),
+      after,
+      filter: { code: filter },
+      scopeId,
+      includeRequestRaw: false,
+      includeResponseRaw: false,
+    });
+    for (const edge of data.requests.edges) ids.push(edge.node.id);
+    if (ids.length > limit || !data.requests.pageInfo.hasNextPage) break;
+    after = data.requests.pageInfo.endCursor;
+  }
+
+  if (ids.length > limit) {
+    die(`Error: filter matches more than --limit ${limit}; narrow the row window or raise --limit.`);
+  }
+  return ids;
+}
+
+function updateRequestColorDocument(count) {
+  const variables = Array.from({ length: count }, (_, index) => `$id${index}: ID!`).join(", ");
+  const fields = Array.from({ length: count }, (_, index) =>
+    `r${index}: updateRequestMetadata(id: $id${index}, input: { color: $color }) { metadata { id color } }`
+  ).join("\n");
+  return `mutation SetRequestColors(${variables}, $color: String) {\n${fields}\n}`;
+}
+
+async function cmdSetColor(color, ids, filter, scope, limit) {
+  const selectedColor = color === "clear" ? { name: null, value: null } : pwnfoxColorValue(color);
+  const client = await getClient();
+  const scopeId = scope ? await resolveScopeId(client, scope) : undefined;
+  const selectedIds = ids || await requestIdsForColorUpdate(client, filter, scopeId, limit);
+  if (!selectedIds.length) {
+    printJson({ color: selectedColor.name, updated: [], count: 0 });
+    return;
+  }
+
+  const updated = [];
+  for (let offset = 0; offset < selectedIds.length; offset += 100) {
+    const chunk = selectedIds.slice(offset, offset + 100);
+    const variables = { color: selectedColor.value };
+    for (let index = 0; index < chunk.length; index++) variables[`id${index}`] = chunk[index];
+    const data = await client.graphql(updateRequestColorDocument(chunk.length), variables);
+    for (let index = 0; index < chunk.length; index++) {
+      if (data[`r${index}`]?.metadata) updated.push(chunk[index]);
+    }
+  }
+  printJson({ color: selectedColor.name, updated, count: updated.length });
 }
 
 async function cmdRecent(limit) {
@@ -1416,6 +1568,7 @@ async function cmdRecent(limit) {
     statusCode: e.node.response?.statusCode,
     roundtrip: e.node.response?.roundtripTime,
     createdAt: e.node.createdAt,
+    color: requestColorName(e.node.metadata?.color),
   }));
   printJson({ results, count: results.length });
 }
@@ -2868,7 +3021,8 @@ Usage:
   caido-client.mjs <command> [options]
 
 HTTP history:
-  search <filter> [--limit n] [--after cursor] [--ids-only] [--desc|--latest] [--scope id-or-name]
+  search <filter> [--limit n] [--after cursor] [--ids-only] [--desc|--latest] [--scope id-or-name] [--color name] [--scan-limit n]
+  set-color <name|clear> (--ids id,id | --filter httpql) [--scope id-or-name] [--limit n]
   recent [--limit n]
   get <request-id> [output options]
   get-response <request-id> [output options]
@@ -2966,20 +3120,57 @@ async function main() {
       let idsOnly = false;
       let desc = false;
       let scope;
+      let color;
+      let scanLimit = DEFAULT_COLOR_SCAN_LIMIT;
       for (let i = 2; i < args.length; i++) {
-        if (args[i] === "--limit" && args[i + 1]) { limit = parseInt(args[i + 1], 10); i++; }
-        else if (args[i] === "--after" && args[i + 1]) { after = args[i + 1]; i++; }
+        if (args[i] === "--limit") { limit = parseInt(requireFlagValue(args, i, "--limit"), 10); i++; }
+        else if (args[i] === "--after") { after = requireFlagValue(args, i, "--after"); i++; }
         else if (args[i] === "--ids-only") idsOnly = true;
         else if (args[i] === "--desc" || args[i] === "--latest") desc = true;
         else if (args[i] === "--scope") { scope = requireFlagValue(args, i, "--scope"); i++; }
+        else if (args[i] === "--color") { color = requireFlagValue(args, i, "--color"); i++; }
+        else if (args[i] === "--scan-limit") { scanLimit = parseInt(requireFlagValue(args, i, "--scan-limit"), 10); i++; }
       }
-      await cmdSearch(filter, limit, after, idsOnly, desc, scope);
+      if (!Number.isFinite(limit) || limit <= 0) die("Error: --limit must be a positive integer");
+      if (!Number.isFinite(scanLimit) || scanLimit <= 0) die("Error: --scan-limit must be a positive integer");
+      await cmdSearch(filter, limit, after, idsOnly, desc, scope, color, scanLimit);
       break;
     }
     case "recent": {
       let limit = 20;
       for (let i = 1; i < args.length; i++) if (args[i] === "--limit" && args[i + 1]) { limit = parseInt(args[i + 1], 10); i++; }
       await cmdRecent(limit);
+      break;
+    }
+    case "set-color": {
+      if (!args[1]) die("Error: color required");
+      let ids;
+      let filter;
+      let scope;
+      let limit = MAX_COLOR_UPDATES;
+      for (let i = 2; i < args.length; i++) {
+        if (args[i] === "--ids") {
+          ids = splitList(requireFlagValue(args, i, "--ids"));
+          i++;
+        } else if (args[i] === "--filter") {
+          filter = requireFlagValue(args, i, "--filter");
+          i++;
+        } else if (args[i] === "--scope") {
+          scope = requireFlagValue(args, i, "--scope");
+          i++;
+        } else if (args[i] === "--limit") {
+          limit = parseInt(requireFlagValue(args, i, "--limit"), 10);
+          i++;
+        }
+      }
+      if (!!ids === !!filter) die("Error: pass exactly one of --ids or --filter");
+      if (ids && !ids.length) die("Error: --ids needs at least one request id");
+      if (ids && scope) die("Error: --scope applies only to --filter; explicit ids are already exact");
+      if (!Number.isFinite(limit) || limit <= 0 || limit > MAX_COLOR_UPDATES) {
+        die(`Error: --limit must be between 1 and ${MAX_COLOR_UPDATES}`);
+      }
+      if (ids && ids.length > MAX_COLOR_UPDATES) die(`Error: --ids accepts at most ${MAX_COLOR_UPDATES} request ids`);
+      await cmdSetColor(args[1].toLowerCase(), ids, filter, scope, limit);
       break;
     }
     case "get": {
@@ -3620,6 +3811,7 @@ fragment RequestFull on Request {
   createdAt
   alteration
   edited
+  metadata { color }
   raw @include(if: $includeRequestRaw)
   response {
     ...ResponseFull

@@ -36,7 +36,8 @@ npm install ws
 - **Version fork:** replay operations branch at Caido 0.57.0 (`*_V056` vs `*_V057`), the same
   threshold the SDK uses for its own transport fork (`TransportVersion.V0_57`).
 - **Last verified:** 2026-07-30 against sdk-client 0.5.0. No drift — every document change since
-  0.4.0 was additive (new operations only, no edits to the ones already used here).
+  0.4.0 was additive (new operations only, no edits to the ones already used here). Request color
+  metadata was verified live against 0.57.1 on 2026-08-22.
 
 Intercept control and Automate have no SDK coverage; those operations are hand-written and verified
 against a live instance instead.
@@ -66,6 +67,7 @@ The embedded GraphQL is field-checked against the canonical documents in [`caido
 | Repeating one request | `edit --values` sends one per value in a single session, a row each, stopping on backoff | one invocation per value |
 | Rate discipline | `--delay` paces sends per host across processes; 429, challenge, 503 and `Retry-After` are reported as `backoff` | no pacing, no backoff signal |
 | Scope | `search --scope` filters history by a Caido scope | not exposed |
+| Browser identity | `set-color` writes and `search --color blue` filters the stored PwnFox palette without sending an identity header | not exposed |
 | Coverage | `sitemap` gives Caido's deduplicated tree of what has been seen on a host | not exposed |
 | WebSocket | `streams` and `stream-messages` read WS and SSE traffic with StreamQL filtering, which `search` cannot see; `ws-connect` / `ws-send` / `ws-stop` open a WS replay session and push frames into it | not exposed |
 | DNS | `dns-rewrites` and `dns-upstreams` read and write resolution, so a name can be pointed at an internal address with the Host header, SNI and certificate left intact — for browser traffic as well as this client's | not exposed |
@@ -143,8 +145,24 @@ Search HTTP history:
 
 ```bash
 node caido-client.mjs search 'req.host.cont:"api"' --limit 20
+node caido-client.mjs search 'req.path.cont:"/api/"' --color blue --desc --limit 20
 node caido-client.mjs recent --limit 10
 ```
+
+`--color` accepts PwnFox's `yellow`, `red`, `orange`, `green`, `magenta`, `cyan`, or `blue`.
+Caido does not expose row color to HTTPQL, so the client scans stored request metadata in pages;
+`--scan-limit` defaults to 5000 and a warning includes the continuation cursor when that bound is
+reached.
+
+Color a bounded browser-action window without sending a marker to the target:
+
+```bash
+node caido-client.mjs set-color blue \
+  --filter 'row.id.gt:1200 AND row.id.lte:1240' --scope "Target Corp"
+```
+
+`set-color` also accepts `--ids 1201,1202` and `clear` in place of a color. A filter matching more
+than `--limit` (default and maximum 1000) is refused before any row changes.
 
 Retrieve requests and responses:
 
